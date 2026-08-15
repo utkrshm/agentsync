@@ -82,7 +82,7 @@ func Load() (Config, bool, error) {
 	if err != nil {
 		return cfg, false, fmt.Errorf("parse %s: %w", p, err)
 	}
-	cfg.ApplyDefaults(md)
+	cfg.ApplyDefaults(md.IsDefined)
 	return cfg, true, nil
 }
 
@@ -90,8 +90,11 @@ func Load() (Config, bool, error) {
 // config.toml (older files predate the watch section). Existing non-zero
 // values are preserved. The OpenCode watcher defaults to enabled when the
 // `watch.opencode.enabled` key is absent entirely; an explicit
-// `enabled = false` is respected (md.IsDefined is true then).
-func (c *Config) ApplyDefaults(md toml.MetaData) {
+// `enabled = false` is respected (isDefined returns true then).
+//
+// isDefined reports whether a dotted key was present in the source; pass
+// nil to treat nothing as defined (e.g. a freshly-created config).
+func (c *Config) ApplyDefaults(isDefined func(keys ...string) bool) {
 	if c.Sync.DebounceSeconds <= 0 {
 		c.Sync.DebounceSeconds = defaultDebounceSeconds
 	}
@@ -101,7 +104,7 @@ func (c *Config) ApplyDefaults(md toml.MetaData) {
 	if c.Watch.OpenCode.Deny == nil {
 		c.Watch.OpenCode.Deny = []string{}
 	}
-	if !md.IsDefined("watch", "opencode", "enabled") {
+	if isDefined == nil || !isDefined("watch", "opencode", "enabled") {
 		c.Watch.OpenCode.Enabled = true
 	}
 }

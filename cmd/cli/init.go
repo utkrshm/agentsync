@@ -59,6 +59,10 @@ func cmdInit(args []string) error {
 	}
 	cfg.Sync.Remote = repoURL
 
+	// Ensure a fresh config carries the daemon defaults (watch enabled, etc.)
+	// so the written file isn't surprising on first `daemon` run.
+	cfg.ApplyDefaults(func(...string) bool { return false })
+
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
