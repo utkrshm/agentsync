@@ -43,9 +43,9 @@ type WatchEvent struct {
 // type assertion to WriteBacker.
 type Adapter interface {
 	Name() ToolKind
-	WatchPaths() ([]string, error)              // paths to attach fsnotify watches to
+	WatchPaths() ([]string, error)                // paths to attach fsnotify watches to
 	OnChange(event WatchEvent) ([]Session, error) // produce Sessions for a debounced change
-	Mirror(s *Session, repoRoot string) error   // write into sync repo layout
+	Mirror(s *Session, repoRoot string) error     // write into sync repo layout
 }
 
 // WriteBacker is implemented by adapters that support write-back (OpenCode —
