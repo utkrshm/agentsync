@@ -52,8 +52,8 @@ func TestAdapterOnChangeAndMirror(t *testing.T) {
 		},
 		QueryRecent: func(sql string) ([]byte, error) {
 			rows := []changedSession{
-				{ID: "ses_new1", TimeUpdated: 1786822992739},
-				{ID: "ses_new2", TimeUpdated: 1786822993740},
+				{ID: "ses_new1", TimeUpdated: 1786822992739, Directory: projDir},
+				{ID: "ses_new2", TimeUpdated: 1786822993740, Directory: projDir},
 			}
 			return json.Marshal(rows)
 		},
@@ -113,7 +113,7 @@ func TestAdapterOnChangeAndMirror(t *testing.T) {
 			return fixtureExport(outPath, id, projDir)
 		},
 		QueryRecent: func(sql string) ([]byte, error) {
-			rows := []changedSession{{ID: "ses_new1", TimeUpdated: 1786822992739}}
+			rows := []changedSession{{ID: "ses_new1", TimeUpdated: 1786822992739, Directory: projDir}}
 			return json.Marshal(rows)
 		},
 		StateFile: func() (string, error) { return filepath.Join(cfgDir, "opencode-watch.json"), nil },
@@ -134,7 +134,7 @@ func TestOnChangeSkipsExportFailure(t *testing.T) {
 			return os.ErrNotExist // simulate opencode export failing for this id
 		},
 		QueryRecent: func(sql string) ([]byte, error) {
-			rows := []changedSession{{ID: "bad", TimeUpdated: 1786822992739}}
+			rows := []changedSession{{ID: "bad", TimeUpdated: 1786822992739, Directory: "/denied"}}
 			return json.Marshal(rows)
 		},
 		StateFile: func() (string, error) { return filepath.Join(t.TempDir(), "w.json"), nil },
@@ -195,8 +195,8 @@ func TestWatchStateRoundTrip(t *testing.T) {
 	if err := ad2.loadState(); err != nil {
 		t.Fatal(err)
 	}
-	if ad2.lastMirrored != 1786822993740 {
-		t.Errorf("expected persisted watermark, got %d", ad2.lastMirrored)
+	if got := ad2.acknowledged["ses_1"]; got != 1786822993740 {
+		t.Errorf("expected persisted per-session acknowledgement, got %d", got)
 	}
 }
 

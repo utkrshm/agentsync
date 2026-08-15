@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,67 +10,77 @@ import (
 	"agentsync/internal/session"
 )
 
-func TestWriteBackImportsAndPatches(t *testing.T) {
-	// A project dir that is a real git repo so PatchImport's deriveProjectID
-	// (fallback path) is exercised without a remote.
+func compatibleVersion() (string, error) { return "1.18.18", nil }
+
+func TestWriteBackImportsFromTargetAndVerifies(t *testing.T) {
 	proj := filepath.Join(t.TempDir(), "proj")
 	if err := os.MkdirAll(proj, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	mustGit(t, proj, "init", "-q", "-b", "main")
-
-	// Payload export file with a projectID to patch from.
 	export := filepath.Join(t.TempDir(), "export.json")
 	if err := fixtureExport(export, "ses_import1", proj); err != nil {
 		t.Fatal(err)
 	}
-
-	imported := ""
+	gotPath, gotDir := "", ""
+	verified := false
 	ad := &Adapter{
-		Import:       func(p string) error { imported = p; return nil },
+		ImportInto:   func(path, dir string) error { gotPath, gotDir = path, dir; return nil },
 		PatchImport:  func(string, string, string) error { return nil },
+		ToolVersion:  compatibleVersion,
+		VerifyImport: func(path, dir string) error { verified = path == export && dir == proj; return nil },
 		ProcessGuard: func(string) (bool, error) { return false, nil },
 	}
-	if err := ad.WriteBack(&session.Session{
-		ID:           "ses_import1",
-		CanonicalKey: "github.com-user-x",
-		PayloadPath:  export,
-	}, proj); err != nil {
+	if err := ad.WriteBack(&session.Session{ID: "ses_import1", CanonicalKey: "github.com-user-x", PayloadPath: export}, proj); err != nil {
 		t.Fatalf("WriteBack: %v", err)
 	}
-	if imported != export {
-		t.Errorf("expected Import called with %s, got %s", export, imported)
+	if gotPath != export || gotDir != proj || !verified {
+		t.Fatalf("target-aware import path=%q dir=%q verified=%v", gotPath, gotDir, verified)
 	}
 }
 
-func TestBroadcastSkipsBusyCandidate(t *testing.T) {
+func TestWriteBackRefusesVersionMismatch(t *testing.T) {
+	export := filepath.Join(t.TempDir(), "export.json")
+	if err := fixtureExport(export, "ses_version", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	ad := &Adapter{
+		ImportInto:  func(string, string) error { called = true; return nil },
+		ToolVersion: func() (string, error) { return "9.9.9", nil },
+	}
+	err := ad.WriteBack(&session.Session{ID: "ses_version", PayloadPath: export}, "/tmp")
+	if err == nil || !strings.Contains(err.Error(), "version mismatch") || called {
+		t.Fatalf("expected fail-closed version mismatch, err=%v importCalled=%v", err, called)
+	}
+}
+
+func TestBroadcastSkipsBusyCandidateAndKeepsFailure(t *testing.T) {
 	export := filepath.Join(t.TempDir(), "export.json")
 	if err := fixtureExport(export, "ses_b1", "/tmp"); err != nil {
 		t.Fatal(err)
 	}
-
-	var imported []string
 	ad := &Adapter{
-		Import:      func(p string) error { imported = append(imported, p); return nil },
-		PatchImport: func(string, string, string) error { return nil },
-		ProcessGuard: func(cand string) (bool, error) {
-			return strings.HasSuffix(cand, "busy"), nil
+		ImportInto: func(path, dir string) error {
+			if strings.HasSuffix(dir, "fail") {
+				return errors.New("import failed")
+			}
+			return nil
 		},
+		PatchImport:  func(string, string, string) error { return nil },
+		ToolVersion:  compatibleVersion,
+		ProcessGuard: func(cand string) (bool, error) { return strings.HasSuffix(cand, "busy"), nil },
 	}
-
 	s := &session.Session{ID: "ses_b1", CanonicalKey: "k", PayloadPath: export}
-	res := ad.BroadcastWriteBack(s, []string{"/tmp/idle", "/tmp/busy"})
-	if len(res.Imported) != 1 {
-		t.Errorf("expected exactly 1 imported (idle), got %v", res.Imported)
-	}
-	if res.Imported[0] != "/tmp/idle" {
-		t.Errorf("expected idle candidate imported, got %v", res.Imported)
+	res := ad.BroadcastWriteBack(s, []string{"/tmp/idle", "/tmp/busy", "/tmp/fail"})
+	if len(res.Imported) != 1 || res.Imported[0] != "/tmp/idle" {
+		t.Fatalf("imports = %v", res.Imported)
 	}
 	if len(res.Busy) != 1 || res.Busy[0] != "/tmp/busy" {
-		t.Errorf("expected busy candidate in Busy, got %v", res.Busy)
+		t.Fatalf("busy = %v", res.Busy)
 	}
-	if res.Degraded {
-		t.Error("single import is not a degraded outcome")
+	if len(res.Failed) != 1 || res.Failed[0].Path != "/tmp/fail" {
+		t.Fatalf("failed = %#v", res.Failed)
 	}
 }
 
@@ -79,49 +90,20 @@ func TestBroadcastDegradedWhenMultipleImported(t *testing.T) {
 		t.Fatal(err)
 	}
 	ad := &Adapter{
-		Import:       func(p string) error { return nil },
+		ImportInto:   func(string, string) error { return nil },
 		PatchImport:  func(string, string, string) error { return nil },
+		ToolVersion:  compatibleVersion,
 		ProcessGuard: func(string) (bool, error) { return false, nil },
 	}
-	s := &session.Session{ID: "ses_b2", CanonicalKey: "k", PayloadPath: export}
-	res := ad.BroadcastWriteBack(s, []string{"/tmp/c1", "/tmp/c2"})
-	if len(res.Imported) != 2 {
-		t.Fatalf("expected both candidates imported, got %v", res.Imported)
-	}
-	if !res.Degraded {
-		t.Error("multiple imports of a one-to-one session must be flagged degraded (invariant #8)")
-	}
-}
-
-func TestBroadcastSkipsOnGuardErrorAndImportError(t *testing.T) {
-	export := filepath.Join(t.TempDir(), "export.json")
-	if err := fixtureExport(export, "ses_b3", "/tmp"); err != nil {
-		t.Fatal(err)
-	}
-	ad := &Adapter{
-		Import:      func(p string) error { return os.ErrNotExist },
-		PatchImport: func(string, string, string) error { return nil },
-		ProcessGuard: func(cand string) (bool, error) {
-			if strings.HasSuffix(cand, "failguard") {
-				return false, os.ErrPermission
-			}
-			return false, nil
-		},
-	}
-	s := &session.Session{ID: "ses_b3", CanonicalKey: "k", PayloadPath: export}
-	res := ad.BroadcastWriteBack(s, []string{"/tmp/failguard", "/tmp/failimport"})
-	if len(res.Imported) != 0 {
-		t.Errorf("expected no imports, got %v", res.Imported)
-	}
-	if len(res.Busy) != 0 {
-		t.Errorf("guard error is not 'busy', got %v", res.Busy)
+	res := ad.BroadcastWriteBack(&session.Session{ID: "ses_b2", CanonicalKey: "k", PayloadPath: export}, []string{"/tmp/c1", "/tmp/c2"})
+	if len(res.Imported) != 2 || !res.Degraded {
+		t.Fatalf("expected degraded two-clone result, got %#v", res)
 	}
 }
 
 func TestWriteBackNoPayloadErrors(t *testing.T) {
-	ad := &Adapter{Import: func(string) error { return nil }}
-	err := ad.WriteBack(&session.Session{ID: "x"}, "/tmp")
-	if err == nil {
+	ad := &Adapter{ToolVersion: compatibleVersion}
+	if err := ad.WriteBack(&session.Session{ID: "x"}, "/tmp"); err == nil {
 		t.Error("expected error when PayloadPath is empty")
 	}
 }
