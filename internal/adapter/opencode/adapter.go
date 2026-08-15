@@ -28,9 +28,10 @@ import (
 
 // WatchState is the per-device watermark file shape.
 type WatchState struct {
-	// LastMirroredTime is the maximum time_updated (millis, Unix epoch) of any
-	// session already mirrored. Sessions with time_updated <= this are skipped.
-	LastMirroredTime int64 `json:"last_mirrored_time"`
+	// Sessions maps a session ID to the time_updated value successfully mirrored
+	// for that specific session. A global maximum watermark loses out-of-order
+	// updates from another session.
+	Sessions map[string]int64 `json:"sessions"`
 }
 
 // Adapter implements session.Adapter for OpenCode capture. All shell-out
@@ -43,15 +44,30 @@ type Adapter struct {
 	Export func(sessionID, outPath string) error
 	// QueryRecent returns the JSON rows from `opencode db` for the given SQL.
 	QueryRecent func(sql string) ([]byte, error)
-	// Import runs `opencode import <exportPath>`.
+	// Import is retained for fixture compatibility. New write-back uses
+	// ImportInto, which receives the target clone directory.
 	Import func(exportPath string) error
+	// ImportInto runs `opencode import` with targetDir as its working directory.
+	ImportInto func(exportPath, targetDir string) error
+	// PatchImport applies the project_id/directory fix after import.
+	// Injectable for tests (the real one touches the live opencode DB).
+	PatchImport func(exportPath, targetDir, projectKey string) error
 	// ProcessGuard reports whether opencode is running for a project dir
 	// (UID-scoped, best-effort). Injectable for guard tests.
 	ProcessGuard func(targetPath string) (bool, error)
-	// StateFile is the path to the watermark state file.
+	// ToolVersion returns the installed OpenCode version for fail-closed
+	// compatibility checks before write-back.
+	ToolVersion func() (string, error)
+	// VerifyImport confirms the imported session is associated with targetDir.
+	VerifyImport func(exportPath, targetDir string) error
+	// ShouldCapture applies deny policy after resolving session metadata but
+	// before exporting payload content. nil means allow all.
+	ShouldCapture func(localPath string, key session.CanonicalKey) bool
+	// StateFile is the path to the per-session capture state file.
 	StateFile func() (string, error)
 
-	lastMirrored int64 // cached watermark after the first read
+	acknowledged map[string]int64
+	stateLoaded  bool
 }
 
 // NewAdapter returns an Adapter wired to the real opencode CLI.
@@ -61,7 +77,11 @@ func NewAdapter() *Adapter {
 		Export:       Export,
 		QueryRecent:  dbQuery,
 		Import:       Import,
+		ImportInto:   ImportInto,
+		PatchImport:  PatchImport,
 		ProcessGuard: IsToolRunning,
+		ToolVersion:  ToolVersion,
+		VerifyImport: VerifyImport,
 		StateFile:    stateFilePath,
 	}
 }
@@ -70,6 +90,7 @@ func NewAdapter() *Adapter {
 type changedSession struct {
 	ID          string `json:"id"`
 	TimeUpdated int64  `json:"time_updated"`
+	Directory   string `json:"directory"`
 }
 
 // Name implements session.Adapter.
@@ -93,11 +114,11 @@ func (a *Adapter) OnChange(ev session.WatchEvent) ([]session.Session, error) {
 	if err := a.loadState(); err != nil {
 		return nil, err
 	}
-	// Ignore events for paths we don't care about (e.g. a stray file in the
-	// data dir); OnChange is triggered for the DB and its WAL/SHM siblings.
-	rows, err := a.QueryRecent(fmt.Sprintf(
-		`SELECT id, time_updated FROM session WHERE time_updated > %d ORDER BY time_updated ASC`,
-		a.lastMirrored))
+	// OpenCode uses one database for all projects. We query only session
+	// metadata, evaluate policy, and only then export an allowed payload.
+	// Per-session acknowledgement avoids losing an older update after another
+	// session advanced a global timestamp watermark.
+	rows, err := a.QueryRecent(`SELECT id, time_updated, directory FROM session ORDER BY time_updated ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -108,18 +129,17 @@ func (a *Adapter) OnChange(ev session.WatchEvent) ([]session.Session, error) {
 
 	var out []session.Session
 	for _, c := range changed {
-		if c.ID == "" {
+		if c.ID == "" || c.TimeUpdated <= a.acknowledged[c.ID] {
 			continue
 		}
-		// Defensive filter in addition to the SQL predicate: honor the
-		// watermark even if the query result is broader than expected
-		// (unknown/renamed columns in a future opencode release).
-		if c.TimeUpdated <= a.lastMirrored {
+		key := canonicalkey.Resolve(c.Directory)
+		if a.ShouldCapture != nil && !a.ShouldCapture(c.Directory, key) {
 			continue
 		}
-		s, err := a.exportOne(c)
+		s, err := a.exportOne(c, key)
 		if err != nil {
-			// A single malformed session must not stop the sweep.
+			// A single malformed session must not stop the sweep. It remains
+			// unacknowledged and will be retried by the next reconciliation.
 			fmt.Fprintf(os.Stderr, "opencode: export %s: %v\n", c.ID, err)
 			continue
 		}
@@ -131,7 +151,7 @@ func (a *Adapter) OnChange(ev session.WatchEvent) ([]session.Session, error) {
 // exportOne exports a single session to a temp file and builds the Session.
 // The temp file is intentionally left in place: Mirror copies it into the sync
 // repo layout, after which the caller may remove s.PayloadPath.
-func (a *Adapter) exportOne(c changedSession) (*session.Session, error) {
+func (a *Adapter) exportOne(c changedSession, key session.CanonicalKey) (*session.Session, error) {
 	tmp, err := os.CreateTemp("", "agentsync-export-*.json")
 	if err != nil {
 		return nil, err
@@ -148,7 +168,12 @@ func (a *Adapter) exportOne(c changedSession) (*session.Session, error) {
 		os.Remove(tmpPath)
 		return nil, err
 	}
-	key := canonicalkey.Resolve(info.Directory)
+	if info.Directory == "" {
+		return nil, fmt.Errorf("exported session %s has no directory", c.ID)
+	}
+	if key == "" {
+		key = canonicalkey.Resolve(info.Directory)
+	}
 	return &session.Session{
 		ID:           c.ID,
 		Tool:         session.ToolOpenCode,
@@ -189,16 +214,18 @@ func (a *Adapter) Mirror(s *session.Session, repoRoot string) error {
 		return err
 	}
 
-	// Advance the watermark: max of the last mirror time and this session's.
-	if t := s.LastModified.UnixMilli(); t > a.lastMirrored {
-		a.lastMirrored = t
+	if a.acknowledged == nil {
+		a.acknowledged = map[string]int64{}
 	}
+	// Acknowledge only after export, copy, metadata write, and state update
+	// all reached this point successfully.
+	a.acknowledged[s.ID] = s.LastModified.UnixMilli()
 	return a.saveState()
 }
 
-// loadState reads the watermark from the state file once.
+// loadState reads per-session acknowledgements from the state file once.
 func (a *Adapter) loadState() error {
-	if a.lastMirrored != 0 {
+	if a.stateLoaded {
 		return nil
 	}
 	p, err := a.StateFile()
@@ -208,7 +235,9 @@ func (a *Adapter) loadState() error {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // first run — no watermark, export everything
+			a.acknowledged = map[string]int64{}
+			a.stateLoaded = true
+			return nil
 		}
 		return err
 	}
@@ -216,11 +245,15 @@ func (a *Adapter) loadState() error {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return fmt.Errorf("parse watch state %s: %w", p, err)
 	}
-	a.lastMirrored = st.LastMirroredTime
+	if st.Sessions == nil {
+		st.Sessions = map[string]int64{}
+	}
+	a.acknowledged = st.Sessions
+	a.stateLoaded = true
 	return nil
 }
 
-// saveState persists the watermark.
+// saveState persists per-session acknowledgements.
 func (a *Adapter) saveState() error {
 	p, err := a.StateFile()
 	if err != nil {
@@ -229,7 +262,10 @@ func (a *Adapter) saveState() error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(WatchState{LastMirroredTime: a.lastMirrored}, "", "  ")
+	if a.acknowledged == nil {
+		a.acknowledged = map[string]int64{}
+	}
+	data, err := json.MarshalIndent(WatchState{Sessions: a.acknowledged}, "", "  ")
 	if err != nil {
 		return err
 	}

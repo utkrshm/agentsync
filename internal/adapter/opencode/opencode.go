@@ -63,12 +63,68 @@ func Export(sessionID, outPath string) error {
 	return os.WriteFile(outPath, []byte(stdout.String()), 0o600)
 }
 
-// Import runs `opencode import <exportPath>`.
+// Import runs `opencode import <exportPath>` using the current process
+// working directory. New write-back code must use ImportInto so OpenCode
+// associates the import with the resolved target clone.
 func Import(exportPath string) error {
+	return ImportInto(exportPath, "")
+}
+
+// ImportInto runs `opencode import <exportPath>` from targetDir. OpenCode
+// derives project context from its invocation directory, so omitting Cmd.Dir
+// makes cross-device write-back target-dependent by accident.
+func ImportInto(exportPath, targetDir string) error {
 	cmd := exec.Command(binName, "import", exportPath)
+	if targetDir != "" {
+		cmd.Dir = targetDir
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("opencode import %s: %w: %s", exportPath, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ToolVersion returns the installed OpenCode version for write-back
+// compatibility checks.
+func ToolVersion() (string, error) {
+	cmd := exec.Command(binName, "--version")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("opencode --version: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	v := normalizeVersion(string(out))
+	if v == "" {
+		return "", fmt.Errorf("opencode --version returned no version")
+	}
+	return v, nil
+}
+
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "opencode ")
+	v = strings.TrimPrefix(v, "OpenCode ")
+	return strings.TrimSpace(v)
+}
+
+// VerifyImport confirms that the patch associated the imported session with
+// targetDir. It validates the same narrow schema boundary PatchImport uses.
+func VerifyImport(exportPath, targetDir string) error {
+	info, err := readExportInfo(exportPath)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", "file:"+mustDBPath()+"?mode=ro")
+	if err != nil {
+		return fmt.Errorf("open opencode db for verification: %w", err)
+	}
+	defer db.Close()
+	var directory string
+	if err := db.QueryRow(`SELECT directory FROM session WHERE id = ?`, info.ID).Scan(&directory); err != nil {
+		return fmt.Errorf("verify imported session %s: %w", info.ID, err)
+	}
+	if filepath.Clean(directory) != filepath.Clean(targetDir) {
+		return fmt.Errorf("verify imported session %s: directory %q, want %q", info.ID, directory, targetDir)
 	}
 	return nil
 }

@@ -1,17 +1,4 @@
 // OpenCode write-back adapter (IMPLEMENTATION-PLAN.md §5, Phase 3).
-//
-// Write-back makes a synced session resumable on this device: it imports the
-// mirrored export into OpenCode and patches the project_id/directory columns
-// so the session lands on the correct local project (Phase 0 findings §4–5).
-//
-// Safety per AGENTS.md invariants #2 and #8:
-//   - Every candidate local path is guarded independently with a UID-scoped,
-//     best-effort process check (never a lock) before import.
-//   - Because OpenCode's session↔project model is one-to-one and the session
-//     ID is preserved on import, broadcasting across multiple clones of the
-//     same repo "moves" the association to the last-imported clone rather
-//     than duplicating it. That degraded outcome must be reported as exactly
-//     what it is, not as full success.
 package opencode
 
 import (
@@ -23,18 +10,61 @@ import (
 // Compile-time assertion: the capture Adapter also implements WriteBacker.
 var _ session.WriteBacker = (*Adapter)(nil)
 
-// WriteBack implements session.WriteBacker: import the mirrored export into
-// OpenCode targeting the given local project directory, then patch the
-// project association. The caller has already guard-checked this candidate.
-func (a *Adapter) WriteBack(s *session.Session, targetLocalPath string) error {
+// ValidateArtifact checks the export version against the installed tool without
+// modifying OpenCode state. It is used by both dry-run and write-back.
+func (a *Adapter) ValidateArtifact(s *session.Session) error {
 	if s.PayloadPath == "" {
 		return fmt.Errorf("session %s has no mirrored export to write back", s.ID)
 	}
-	if err := a.Import(s.PayloadPath); err != nil {
+	info, err := readExportInfo(s.PayloadPath)
+	if err != nil {
+		return err
+	}
+	if info.Version == "" {
+		return fmt.Errorf("session %s export has no OpenCode version; refusing undocumented write-back", s.ID)
+	}
+	if a.ToolVersion == nil {
+		return fmt.Errorf("installed OpenCode version check is not configured")
+	}
+	installed, err := a.ToolVersion()
+	if err != nil {
+		return fmt.Errorf("read installed OpenCode version: %w", err)
+	}
+	if normalizeVersion(installed) != normalizeVersion(info.Version) {
+		return fmt.Errorf("OpenCode version mismatch: export is %s, installed is %s; refusing write-back", info.Version, installed)
+	}
+	return nil
+}
+
+// WriteBack imports the artifact from the resolved target directory, applies
+// the association patch, and verifies that the session is associated with the
+// target. The caller has already applied the current-user process guard.
+func (a *Adapter) WriteBack(s *session.Session, targetLocalPath string) error {
+	if err := a.ValidateArtifact(s); err != nil {
+		return err
+	}
+	var err error
+	if a.ImportInto != nil {
+		err = a.ImportInto(s.PayloadPath, targetLocalPath)
+	} else if a.Import != nil {
+		// Compatibility for old injected fixtures. Production adapters always
+		// provide ImportInto.
+		err = a.Import(s.PayloadPath)
+	} else {
+		err = fmt.Errorf("OpenCode import is not configured")
+	}
+	if err != nil {
 		return err
 	}
 	if a.PatchImport != nil {
-		return a.PatchImport(s.PayloadPath, targetLocalPath, string(s.CanonicalKey))
+		if err := a.PatchImport(s.PayloadPath, targetLocalPath, string(s.CanonicalKey)); err != nil {
+			return err
+		}
+	}
+	if a.VerifyImport != nil {
+		if err := a.VerifyImport(s.PayloadPath, targetLocalPath); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -44,48 +74,44 @@ func (a *Adapter) IsToolRunning(targetLocalPath string) (bool, error) {
 	return a.ProcessGuard(targetLocalPath)
 }
 
-// BroadcastResult summarizes a multi-candidate write-back attempt (SPEC-DOC.md
-// §4.1, invariant #8).
-type BroadcastResult struct {
-	// Candidates is every local path resolved for the session's canonical key.
-	Candidates []string
-	// Imported are the candidates the session was successfully imported into.
-	Imported []string
-	// Busy are the candidates skipped because opencode was running there.
-	Busy []string
-	// Degraded is true when the import succeeded into multiple candidates but
-	// OpenCode's one-to-one model means the session actually only resides in
-	// the last-imported clone.
-	Degraded bool
+// CandidateFailure preserves a retryable failure per clone instead of
+// collapsing a partial broadcast into a global session failure.
+type CandidateFailure struct {
+	Path  string
+	Error string
 }
 
-// BroadcastWriteBack attempts write-back independently against every candidate
-// local path. A busy candidate is skipped without failing the others. It
-// returns a BroadcastResult so the caller can log the outcome (including the
-// degraded case) rather than just success/failure.
+// BroadcastResult summarizes a multi-candidate write-back attempt.
+type BroadcastResult struct {
+	Candidates []string
+	Imported   []string
+	Busy       []string
+	Failed     []CandidateFailure
+	Degraded   bool
+}
+
+// BroadcastWriteBack attempts every candidate independently. A busy or failed
+// candidate stays pending in device-local receive state and is retried later.
 func (a *Adapter) BroadcastWriteBack(s *session.Session, candidates []string) BroadcastResult {
-	var res BroadcastResult
-	res.Candidates = candidates
+	res := BroadcastResult{Candidates: append([]string(nil), candidates...)}
 	for _, cand := range candidates {
 		running, err := a.ProcessGuard(cand)
 		if err != nil {
-			fmt.Printf("writeback: guard check failed for %s (%s): %v (skipping)\n", cand, s.ID, err)
+			res.Failed = append(res.Failed, CandidateFailure{Path: cand, Error: fmt.Sprintf("guard check: %v", err)})
 			continue
 		}
 		if running {
-			fmt.Printf("writeback: opencode running in %s — skipping %s (retry on next pull)\n", cand, s.ID)
 			res.Busy = append(res.Busy, cand)
 			continue
 		}
 		if err := a.WriteBack(s, cand); err != nil {
-			fmt.Printf("writeback: import into %s failed for %s: %v (skipping)\n", cand, s.ID, err)
+			res.Failed = append(res.Failed, CandidateFailure{Path: cand, Error: err.Error()})
 			continue
 		}
 		res.Imported = append(res.Imported, cand)
 	}
-	// Degraded outcome: >1 candidate import attempted and more than one
-	// succeeded, but the underlying model is one-to-one → the session only
-	// truly lives in the last-imported clone.
+	// OpenCode preserves the session ID but has a one-to-one association, so
+	// multiple successful imports move the association to the last clone.
 	res.Degraded = len(res.Imported) > 1
 	return res
 }

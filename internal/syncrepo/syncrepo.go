@@ -15,9 +15,8 @@ import (
 // the set of session IDs this device has already imported (so `receive` only
 // imports new sessions).
 type SyncMeta struct {
-	SchemaVersion int               `json:"schema_version"`
-	DeviceID      string            `json:"device_id"`
-	Imported      map[string]string `json:"imported,omitempty"` // sessionID -> ISO timestamp imported
+	SchemaVersion int    `json:"schema_version"`
+	DeviceID      string `json:"device_id"`
 }
 
 // Repo wraps a sync repo working tree and provides git operations that
@@ -56,7 +55,7 @@ func (r *Repo) Init() error {
 		return err
 	}
 	// Ensure .sync-meta.json exists so it's tracked from the start.
-	if err := r.WriteMeta(SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID(), Imported: map[string]string{}}); err != nil {
+	if err := r.WriteMeta(SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID()}); err != nil {
 		return err
 	}
 	return nil
@@ -191,14 +190,11 @@ func (r *Repo) TouchMeta() error {
 	m, err := r.ReadMeta()
 	if err != nil {
 		// Fresh repo / missing meta: seed with defaults.
-		m = SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID(), Imported: map[string]string{}}
+		m = SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID()}
 	}
 	m.SchemaVersion = 1
 	if m.DeviceID == "" {
 		m.DeviceID = newDeviceID()
-	}
-	if m.Imported == nil {
-		m.Imported = map[string]string{}
 	}
 	return r.WriteMeta(m)
 }

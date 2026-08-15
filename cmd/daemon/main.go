@@ -86,6 +86,12 @@ func run() error {
 // runOpenCodeWatcher wires the OpenCode capture adapter into the watch core.
 func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.Repo) error {
 	ad := opencode.NewAdapter()
+	// OpenCode stores every project in one database. Evaluate deny policy from
+	// per-session metadata before export, not from the shared DB filename.
+	ad.ShouldCapture = func(localPath string, key session.CanonicalKey) bool {
+		return !watch.DenyMatches(cfg.Watch.OpenCode.Deny, localPath) &&
+			!watch.DenyMatches(cfg.Watch.OpenCode.Deny, string(key))
+	}
 	w, err := watch.New(watch.Options{
 		Adapter:   ad,
 		Debounce:  time.Duration(cfg.Sync.DebounceSeconds) * time.Second,

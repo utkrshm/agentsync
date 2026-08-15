@@ -280,3 +280,19 @@ func devOf(path string) uint64 {
 	}
 	return ^uint64(0)
 }
+
+// ValidateCandidate rechecks a cached repo-index entry before write-back.
+// The index is a performance cache, not authority for a destructive action.
+func ValidateCandidate(key session.CanonicalKey, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("candidate %s is unavailable: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("candidate %s is not a directory", path)
+	}
+	if got := canonicalkey.Resolve(path); got != key {
+		return fmt.Errorf("candidate %s resolves to %q, want %q", path, got, key)
+	}
+	return nil
+}

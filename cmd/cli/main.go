@@ -12,7 +12,7 @@ const usage = `agent-sync — sync AI agent sessions across devices via git
 Usage:
   agent-sync init [--repo <url>]              set up the sync repo (prompts for git URL)
   agent-sync send <session-id>                export a session, commit (timestamped+versioned), push
-  agent-sync receive                          pull + write back new sessions into local clones
+  agent-sync receive [--dry-run]              pull + write back pending sessions into local clones
   agent-sync resume [--repo <code-repo>]      pull code + receive + pick a session to resume
   agent-sync pull                             fetch + fast-forward the sync repo only
   agent-sync index                            scan [repoindex] roots for local git repos
