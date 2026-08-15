@@ -151,6 +151,18 @@ func (r *Repo) PullFastForward() error {
 	return nil
 }
 
+// PullForced is the synchronous pre-write-back pull (SPEC-DOC.md §5.2,
+// trigger 4). Unlike the periodic/deferred pull paths it blocks and returns
+// an error to the caller — resuming against stale state is unsafe, so this
+// must not be silently deferred. It is a no-op when the remote is empty or
+// local is already up to date/ahead (same semantics as PullFastForward).
+func (r *Repo) PullForced() error {
+	if err := r.PullFastForward(); err != nil {
+		return fmt.Errorf("pre-write-back pull failed (refusing to write against stale state): %w", err)
+	}
+	return nil
+}
+
 // ReadMeta loads .sync-meta.json from the working tree.
 func (r *Repo) ReadMeta() (SyncMeta, error) {
 	var m SyncMeta

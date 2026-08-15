@@ -183,20 +183,65 @@ func deriveProjectID(targetDir string) (string, error) {
 }
 
 // IsToolRunning reports whether an opencode process is running for the
-// current user (UID-scoped, per AGENTS.md invariant #2). It scans the process
-// table, filtering by owner UID == current user and by the executable name.
-// It is inherently best-effort (TOCTOU) — do not present it as a lock.
+// current user, optionally scoped to a project directory (AGENTS.md invariant
+// #2). It scans the process table, filtering by owner UID == current user and
+// by the executable name. When targetPath is non-empty, it additionally checks
+// each matching process's working directory (via /proc/<pid>/cwd) and only
+// counts processes whose cwd is within targetPath — a per-candidate guard for
+// broadcast write-back. It is inherently best-effort (TOCTOU) — do not present
+// it as a lock.
 func IsToolRunning(targetPath string) (bool, error) {
+	pids, err := matchingPIDs(targetPath)
+	if err != nil {
+		return false, err
+	}
+	return len(pids) > 0, nil
+}
+
+// matchingPIDs returns PIDs of opencode processes owned by the current user.
+// When targetPath is non-empty, only processes whose cwd falls under
+// targetPath are returned (best-effort; a cwd we cannot read is counted, since
+// refusing-to-write is the safe failure mode).
+func matchingPIDs(targetPath string) ([]string, error) {
 	cmd := exec.Command("pgrep", "-u", fmt.Sprint(os.Getuid()), "-f", binName)
 	out, err := cmd.Output()
 	if err != nil {
 		// pgrep exits 1 when no match; that means not running.
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
-	return strings.TrimSpace(string(out)) != "", nil
+	all := strings.Fields(string(out))
+	if targetPath == "" {
+		return all, nil
+	}
+	var scoped []string
+	target := filepath.Clean(targetPath)
+	for _, pid := range all {
+		if cwd, ok := procCWD(pid); !ok || isWithin(cwd, target) {
+			scoped = append(scoped, pid)
+		}
+	}
+	return scoped, nil
+}
+
+// procCWD reads a process's working directory on Linux.
+func procCWD(pid string) (string, bool) {
+	dest, err := os.Readlink(filepath.Join("/proc", pid, "cwd"))
+	if err != nil {
+		return "", false
+	}
+	return dest, true
+}
+
+// isWithin reports whether path equals dir or is a descendant of it.
+func isWithin(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
 // hashString returns a stable hex hash for a string (used for project ids).

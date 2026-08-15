@@ -43,6 +43,11 @@ type Adapter struct {
 	Export func(sessionID, outPath string) error
 	// QueryRecent returns the JSON rows from `opencode db` for the given SQL.
 	QueryRecent func(sql string) ([]byte, error)
+	// Import runs `opencode import <exportPath>`.
+	Import func(exportPath string) error
+	// ProcessGuard reports whether opencode is running for a project dir
+	// (UID-scoped, best-effort). Injectable for guard tests.
+	ProcessGuard func(targetPath string) (bool, error)
 	// StateFile is the path to the watermark state file.
 	StateFile func() (string, error)
 
@@ -52,10 +57,12 @@ type Adapter struct {
 // NewAdapter returns an Adapter wired to the real opencode CLI.
 func NewAdapter() *Adapter {
 	return &Adapter{
-		DataDir:     DataDir,
-		Export:      Export,
-		QueryRecent: dbQuery,
-		StateFile:   stateFilePath,
+		DataDir:      DataDir,
+		Export:       Export,
+		QueryRecent:  dbQuery,
+		Import:       Import,
+		ProcessGuard: IsToolRunning,
+		StateFile:    stateFilePath,
 	}
 }
 

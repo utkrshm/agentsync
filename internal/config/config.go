@@ -13,8 +13,9 @@ import (
 // Canonical-key resolution, repo-index scanning, and per-tool write-back
 // config are out of scope for now.
 type Config struct {
-	Sync  Sync        `toml:"sync"`
-	Watch WatchConfig `toml:"watch"`
+	Sync      Sync        `toml:"sync"`
+	Watch     WatchConfig `toml:"watch"`
+	RepoIndex RepoIndex   `toml:"repoindex"`
 }
 
 type Sync struct {
@@ -37,6 +38,14 @@ type WatchConfig struct {
 type OpenCodeWatch struct {
 	Enabled bool     `toml:"enabled"`
 	Deny    []string `toml:"deny"` // glob patterns against canonical key or raw path
+}
+
+// RepoIndex configures the reverse-resolution scanner (SPEC-DOC.md §4.1).
+type RepoIndex struct {
+	// Roots are the directories the scanner walks to find local git repos.
+	// Empty means the index is not configured — write-back can't locate local
+	// clones until the user sets these (the privacy/speed boundary, §4.1).
+	Roots []string `toml:"roots"`
 }
 
 const (
@@ -103,6 +112,9 @@ func (c *Config) ApplyDefaults(isDefined func(keys ...string) bool) {
 	}
 	if c.Watch.OpenCode.Deny == nil {
 		c.Watch.OpenCode.Deny = []string{}
+	}
+	if c.RepoIndex.Roots == nil {
+		c.RepoIndex.Roots = []string{}
 	}
 	if isDefined == nil || !isDefined("watch", "opencode", "enabled") {
 		c.Watch.OpenCode.Enabled = true
