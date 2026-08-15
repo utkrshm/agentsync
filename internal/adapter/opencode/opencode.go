@@ -1,0 +1,224 @@
+// Package opencode adapts the OpenCode CLI (export/import) for AgentSync.
+// v0.1 supports capture (send) and write-back (receive), OpenCode only.
+//
+// Per AGENTS.md invariant #4 and SPEC-DOC.md §3.2, we interface with OpenCode
+// through its own `export`/`import` commands rather than reading internal
+// storage, except for a minimal, well-scoped SQLite patch that fixes the
+// project_id/directory columns after import (see Phase 0 findings).
+package opencode
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	_ "modernc.org/sqlite"
+)
+
+// binName is the OpenCode CLI binary name on PATH.
+const binName = "opencode"
+
+// DataDir returns the OpenCode data directory, resolved per Phase 0 findings:
+// $XDG_DATA_HOME/opencode when XDG_DATA_HOME is set, else ~/.local/share/opencode.
+// NOTE: OPENCODE_DATA_DIR does not exist in OpenCode 1.18.18 and is ignored.
+func DataDir() (string, error) {
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+		return filepath.Join(xdg, "opencode"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share", "opencode"), nil
+}
+
+// dbPath returns the path to the OpenCode SQLite database.
+func dbPath() (string, error) {
+	dir, err := DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "opencode.db"), nil
+}
+
+// Export runs `opencode export <sessionID>` and writes the resulting JSON to
+// outPath. The command writes its JSON document to stdout (log noise goes to
+// stderr), so we capture stdout only.
+func Export(sessionID, outPath string) error {
+	cmd := exec.Command(binName, "export", sessionID)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("opencode export %s: %w: %s", sessionID, err, strings.TrimSpace(stderr.String()))
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(outPath, []byte(stdout.String()), 0o600)
+}
+
+// Import runs `opencode import <exportPath>`.
+func Import(exportPath string) error {
+	cmd := exec.Command(binName, "import", exportPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("opencode import %s: %w: %s", exportPath, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// exportInfo is the minimal shape of an export file's `info` object we need
+// to read the session id, project id, and directory for the patch step.
+type ExportInfo struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Directory string `json:"directory"`
+	Version   string `json:"version"`
+	Title     string `json:"title"`
+}
+
+// readExportInfo parses just the `info` field of an export JSON file.
+func readExportInfo(path string) (ExportInfo, error) {
+	var doc struct {
+		Info ExportInfo `json:"info"`
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ExportInfo{}, err
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return ExportInfo{}, fmt.Errorf("parse export %s: %w", path, err)
+	}
+	return doc.Info, nil
+}
+
+// ReadExportInfo is the exported accessor for parsing an export file's info.
+func ReadExportInfo(path string) (ExportInfo, error) {
+	return readExportInfo(path)
+}
+
+// PatchImport fixes the project_id and directory of an imported session so it
+// lands on the correct OpenCode project (Phase 0 findings, §4–5). It is
+// idempotent: if the session already has the right project_id, it's a no-op.
+//
+// targetDir is the device-local clone path where the session should live.
+// projectKey is the target project's directory/identity to ensure a project
+// row exists.
+func PatchImport(exportPath, targetDir, projectKey string) error {
+	info, err := readExportInfo(exportPath)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", "file:"+mustDBPath()+"?mode=rw")
+	if err != nil {
+		return fmt.Errorf("open opencode db: %w", err)
+	}
+	defer db.Close()
+
+	// Ensure the target project row exists (id = hash of project key is
+	// unreliable; use the project id from the export if present, else derive).
+	// We prefer the export's own projectID when it's not "global".
+	projectID := info.ProjectID
+	if projectID == "" || projectID == "global" {
+		// Derive a stable project id from the target dir's git remote.
+		pid, err := deriveProjectID(targetDir)
+		if err != nil {
+			return fmt.Errorf("derive target project id: %w", err)
+		}
+		projectID = pid
+	}
+
+	// Upsert project row (ensure exists).
+	if _, err := db.Exec(`
+		INSERT INTO project (id, worktree, sandboxes, commands, time_created, time_updated)
+		VALUES (?, ?, '', '', unixepoch(), unixepoch())
+		ON CONFLICT(id) DO NOTHING`, projectID, targetDir); err != nil {
+		return fmt.Errorf("upsert project row: %w", err)
+	}
+
+	// Upsert project_directory join row.
+	if _, err := db.Exec(`
+		INSERT INTO project_directory (project_id, directory, time_created)
+		VALUES (?, ?, unixepoch())
+		ON CONFLICT(project_id, directory) DO NOTHING`, projectID, targetDir); err != nil {
+		return fmt.Errorf("upsert project_directory row: %w", err)
+	}
+
+	// Fix the session row.
+	res, err := db.Exec(`UPDATE session SET project_id = ?, directory = ? WHERE id = ?`,
+		projectID, targetDir, info.ID)
+	if err != nil {
+		return fmt.Errorf("patch session row: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("session %s not found after import", info.ID)
+	}
+	return nil
+}
+
+func mustDBPath() string {
+	p, err := dbPath()
+	if err != nil {
+		return "opencode.db"
+	}
+	return p
+}
+
+// deriveProjectID produces a stable project id for targetDir by hashing the
+// canonical key or, failing that, the path itself.
+func deriveProjectID(targetDir string) (string, error) {
+	// Try git remote.
+	cmd := exec.Command("git", "-C", targetDir, "remote", "get-url", "origin")
+	out, err := cmd.Output()
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return hashString(strings.TrimSpace(string(out))), nil
+	}
+	return hashString(targetDir), nil
+}
+
+// IsToolRunning reports whether an opencode process is running for the
+// current user (UID-scoped, per AGENTS.md invariant #2). It scans the process
+// table, filtering by owner UID == current user and by the executable name.
+// It is inherently best-effort (TOCTOU) — do not present it as a lock.
+func IsToolRunning(targetPath string) (bool, error) {
+	cmd := exec.Command("pgrep", "-u", fmt.Sprint(os.Getuid()), "-f", binName)
+	out, err := cmd.Output()
+	if err != nil {
+		// pgrep exits 1 when no match; that means not running.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// hashString returns a stable hex hash for a string (used for project ids).
+func hashString(s string) string {
+	h := fnv64(s)
+	return fmt.Sprintf("%x", h)
+}
+
+// fnv64 is a tiny non-crypto hash (FNV-1a 64-bit).
+func fnv64(s string) uint64 {
+	const offset uint64 = 14695981039346656037
+	const prime uint64 = 1099511628211
+	h := offset
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+
+// ProcessTable is only used on non-Linux where pgrep -u may differ; kept as a
+// stub for now since the target deployment is Linux.
+func processTable() []string { return nil }
+
+var _ = runtime.GOOS

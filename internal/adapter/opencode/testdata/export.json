@@ -1,0 +1,27 @@
+{
+  "info": {
+    "id": "ses_fixture0001",
+    "slug": "fixture-session",
+    "projectID": "global",
+    "directory": "/tmp/import-cwd",
+    "title": "Test fixture session",
+    "version": "1.18.18"
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "msg0001",
+        "role": "user",
+        "sessionId": "ses_fixture0001",
+        "time": { "created": 1700000000000, "updated": 1700000001000 }
+      },
+      "parts": [
+        {
+          "id": "prt0001",
+          "type": "text",
+          "text": "hello from fixture"
+        }
+      ]
+    }
+  ]
+}
