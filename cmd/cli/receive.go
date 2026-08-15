@@ -9,11 +9,17 @@ import (
 	"time"
 
 	"agentsync/internal/adapter/opencode"
+	"agentsync/internal/repoindex"
+	"agentsync/internal/session"
 	"agentsync/internal/syncrepo"
 )
 
-// cmdReceive pulls the sync repo and imports any new OpenCode sessions into
-// the local OpenCode data dir, applying the project_id/directory patch.
+// cmdReceive pulls the sync repo and writes back any new OpenCode sessions
+// into local clones of the matching project, applying the
+// project_id/directory patch. Write-back is broadcast across EVERY local
+// clone resolved for a session's canonical key (SPEC-DOC.md §4.1); a clone
+// where opencode is currently running is skipped and retried on the next pull
+// (AGENTS.md invariant #2).
 func cmdReceive(args []string) error {
 	cfg, err := requireConfig()
 	if err != nil {
@@ -25,19 +31,16 @@ func cmdReceive(args []string) error {
 	}
 
 	if cfg.Sync.Remote != "" {
-		if err := repo.PullFastForward(); err != nil {
+		// Blocking pre-write-back pull (SPEC-DOC.md §5.2, trigger 4) — writing
+		// against stale state is the one case where deferring a pull is unsafe.
+		if err := repo.PullForced(); err != nil {
 			return fmt.Errorf("sync-repo pull: %w", err)
 		}
 	}
 
-	// Safety guard: refuse to write to OpenCode storage while it runs for
-	// this user (AGENTS.md invariant #2).
-	running, err := opencode.IsToolRunning("")
+	idx, err := openRepoIndex()
 	if err != nil {
-		return fmt.Errorf("check opencode running: %w", err)
-	}
-	if running {
-		return fmt.Errorf("refusing to receive: opencode is currently running for your user. Close it, then re-run `agent-sync receive`")
+		return err
 	}
 
 	meta, err := repo.ReadMeta()
@@ -48,34 +51,55 @@ func cmdReceive(args []string) error {
 		meta.Imported = map[string]string{}
 	}
 
-	// Discover export files not yet imported.
 	exports, err := findExports(repo.Path)
 	if err != nil {
 		return err
 	}
 
+	ad := opencode.NewAdapter()
 	imported := 0
+	noClone := 0
 	for _, ex := range exports {
 		if _, done := meta.Imported[ex.SessionID]; done {
 			continue
 		}
-		fmt.Printf("Importing %s (%s)...\n", ex.SessionID, ex.Key)
-		if err := opencode.Import(ex.ExportPath); err != nil {
-			fmt.Fprintf(os.Stderr, "  warn: import failed for %s: %v (skipping)\n", ex.SessionID, err)
+		title := ""
+		if im, err := readImportMeta(ex.ImportMetaPath); err == nil {
+			title = im.Title
+		}
+
+		// Resolve every local clone of this session's project.
+		candidates, err := idx.Resolve(session.CanonicalKey(ex.Key))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warn: resolve %s: %v\n", ex.SessionID, err)
 			continue
 		}
-		// Apply patch using the import-meta (target dir + project info).
-		targetDir := ex.Key // fallback: the canonical key is not a path
-		if ex.HasMeta {
-			if im, err := readImportMeta(ex.ImportMetaPath); err == nil && im.Directory != "" {
-				targetDir = im.Directory
-			}
+		if len(candidates) == 0 {
+			// No local clone yet — archived only. Not marked imported, so a
+			// later repo-index rescan after a fresh clone picks it up.
+			noClone++
+			fmt.Printf("Skipping %s (%s): no local clone of project %s found — archived only. Run `agent-sync index` after cloning.\n",
+				ex.SessionID, title, ex.Key)
+			continue
 		}
-		if err := opencode.PatchImport(ex.ExportPath, targetDir, string(ex.Key)); err != nil {
-			fmt.Fprintf(os.Stderr, "  warn: patch failed for %s: %v\n", ex.SessionID, err)
+
+		paths := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			paths = append(paths, c.LocalPath)
 		}
-		meta.Imported[ex.SessionID] = time.Now().UTC().Format(time.RFC3339)
-		imported++
+		s := &session.Session{
+			ID:           ex.SessionID,
+			Tool:         session.ToolOpenCode,
+			CanonicalKey: session.CanonicalKey(ex.Key),
+			PayloadPath:  ex.ExportPath,
+		}
+		fmt.Printf("Writing back %s (%s) to %d clone(s)...\n", ex.SessionID, title, len(paths))
+		res := ad.BroadcastWriteBack(s, paths)
+		reportBroadcast(res, ex.SessionID, ex.Key)
+		if len(res.Imported) > 0 {
+			meta.Imported[ex.SessionID] = time.Now().UTC().Format(time.RFC3339)
+			imported++
+		}
 	}
 
 	if err := repo.WriteMeta(meta); err != nil {
@@ -83,20 +107,51 @@ func cmdReceive(args []string) error {
 	}
 
 	if imported == 0 {
-		fmt.Println("No new sessions to import.")
+		if noClone > 0 {
+			fmt.Printf("No sessions written back (%d had no local clone; configure [repoindex] roots and run `agent-sync index`).\n", noClone)
+		} else {
+			fmt.Println("No new sessions to write back.")
+		}
 	} else {
-		fmt.Printf("Imported %d session(s).\n", imported)
+		fmt.Printf("Wrote back %d session(s).\n", imported)
 		// Commit the .sync-meta.json update so other devices know these were
-		// received (and to keep the sync repo state consistent).
+		// received.
 		ts := time.Now().UTC().Format(time.RFC3339)
 		if _, err := repo.Commit("receive", "sync-meta", ts); err != nil {
-			// It's fine if there's nothing to commit.
 			if !strings.Contains(err.Error(), "nothing to commit") {
 				fmt.Fprintf(os.Stderr, "warn: could not commit meta update: %v\n", err)
 			}
 		}
 	}
 	return nil
+}
+
+// reportBroadcast prints the write-back outcome, explicitly logging the
+// degraded case (SPEC-DOC.md §4.1, AGENTS.md invariant #8).
+func reportBroadcast(res opencode.BroadcastResult, sessionID, key string) {
+	for _, b := range res.Busy {
+		fmt.Printf("  busy: %s — opencode running there, skipped (retry on next pull)\n", b)
+	}
+	for _, i := range res.Imported {
+		fmt.Printf("  imported into %s\n", i)
+	}
+	if res.Degraded {
+		fmt.Printf("  WARNING: %s imported into %d clones, but OpenCode's session↔project model is one-to-one — "+
+			"the session is resumable in the LAST-imported clone only, not all of them (%s).\n",
+			sessionID, len(res.Imported), key)
+	}
+	if len(res.Imported) == 0 && len(res.Busy) == 0 {
+		fmt.Printf("  no clone could be written back for %s\n", sessionID)
+	}
+}
+
+// openRepoIndex opens the repo-index cache DB.
+func openRepoIndex() (*repoindex.DB, error) {
+	p, err := repoindex.DefaultPath()
+	if err != nil {
+		return nil, err
+	}
+	return repoindex.Open(p)
 }
 
 type exportRef struct {

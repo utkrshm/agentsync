@@ -25,6 +25,11 @@ func requireConfig() (config.Config, error) {
 	return cfg, nil
 }
 
+// configFilePath returns the config file location.
+func configFilePath() (string, error) {
+	return config.Path()
+}
+
 // readExportInfoFrom is a thin wrapper over the opencode adapter's parser so
 // the CLI doesn't import it directly with a hidden name.
 func readExportInfoFrom(path string) (opencode.ExportInfo, error) {

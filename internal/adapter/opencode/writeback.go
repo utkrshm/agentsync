@@ -33,7 +33,10 @@ func (a *Adapter) WriteBack(s *session.Session, targetLocalPath string) error {
 	if err := a.Import(s.PayloadPath); err != nil {
 		return err
 	}
-	return PatchImport(s.PayloadPath, targetLocalPath, string(s.CanonicalKey))
+	if a.PatchImport != nil {
+		return a.PatchImport(s.PayloadPath, targetLocalPath, string(s.CanonicalKey))
+	}
+	return nil
 }
 
 // IsToolRunning implements session.WriteBacker (per-candidate guard).
