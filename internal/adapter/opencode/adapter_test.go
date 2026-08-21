@@ -96,13 +96,17 @@ func TestAdapterOnChangeAndMirror(t *testing.T) {
 		}
 	}
 
-	// The watermark must have advanced to the max time_updated.
+	// Mirror creates artifacts but does not acknowledge them before commit.
 	st, err := os.ReadFile(filepath.Join(cfgDir, "opencode-watch.json"))
-	if err != nil {
+	if err == nil && strings.Contains(string(st), "1786822993740") {
+		t.Errorf("mirror acknowledged before commit: %s", st)
+	}
+	if err := ad.Acknowledge(sessions); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(st), "1786822993740") {
-		t.Errorf("watermark should be the max time_updated, got %s", st)
+	st, err = os.ReadFile(filepath.Join(cfgDir, "opencode-watch.json"))
+	if err != nil || !strings.Contains(string(st), "1786822993740") {
+		t.Errorf("acknowledgement should persist after commit, got %s err=%v", st, err)
 	}
 
 	// Second sweep with the watermark set: a fake query returning only the old
@@ -189,6 +193,9 @@ func TestWatchStateRoundTrip(t *testing.T) {
 	if err := ad.Mirror(s, repo); err != nil {
 		t.Fatal(err)
 	}
+	if err := ad.Acknowledge([]session.Session{*s}); err != nil {
+		t.Fatal(err)
+	}
 	// Fresh adapter should read the persisted watermark.
 	ad2 := NewAdapter()
 	ad2.StateFile = func() (string, error) { return p, nil }
@@ -197,6 +204,44 @@ func TestWatchStateRoundTrip(t *testing.T) {
 	}
 	if got := ad2.acknowledged["ses_1"]; got != 1786822993740 {
 		t.Errorf("expected persisted per-session acknowledgement, got %d", got)
+	}
+}
+
+func TestMirrorWithoutCommitAcknowledgementIsRetried(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "opencode-watch.json")
+	project := t.TempDir()
+	repo := t.TempDir()
+	payload := filepath.Join(t.TempDir(), "payload.json")
+	if err := fixtureExport(payload, "ses_retry_commit", project); err != nil {
+		t.Fatal(err)
+	}
+	s := session.Session{
+		ID:           "ses_retry_commit",
+		Tool:         session.ToolOpenCode,
+		CanonicalKey: "key",
+		LastModified: time.UnixMilli(42),
+		PayloadPath:  payload,
+	}
+	ad := &Adapter{
+		StateFile: func() (string, error) { return state, nil },
+	}
+	if err := ad.Mirror(&s, repo); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a failed Git commit: the caller must not acknowledge yet.
+	ad2 := &Adapter{
+		QueryRecent: func(string) ([]byte, error) {
+			return json.Marshal([]changedSession{{ID: s.ID, TimeUpdated: 42, Directory: project}})
+		},
+		Export:    func(id, out string) error { return fixtureExport(out, id, project) },
+		StateFile: func() (string, error) { return state, nil },
+	}
+	got, err := ad2.OnChange(session.WatchEvent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != s.ID {
+		t.Fatalf("uncommitted mirror should be retried, got %#v", got)
 	}
 }
 

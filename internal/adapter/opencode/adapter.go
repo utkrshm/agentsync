@@ -70,6 +70,12 @@ type Adapter struct {
 	stateLoaded  bool
 }
 
+// CaptureAcknowledger is implemented by capture adapters whose durable source
+// cursor must advance only after the sync-repo commit succeeds.
+type CaptureAcknowledger interface {
+	Acknowledge([]session.Session) error
+}
+
 // NewAdapter returns an Adapter wired to the real opencode CLI.
 func NewAdapter() *Adapter {
 	return &Adapter{
@@ -185,8 +191,9 @@ func (a *Adapter) exportOne(c changedSession, key session.CanonicalKey) (*sessio
 }
 
 // Mirror implements session.Adapter: copy the export into the sync repo
-// layout and write the receive-side import-meta. Also advances the per-device
-// watermark so OnChange won't re-export this session.
+// layout and write the receive-side import-meta. Capture acknowledgement is a
+// separate operation because the daemon must not advance its cursor until the
+// sync-repo commit succeeds.
 func (a *Adapter) Mirror(s *session.Session, repoRoot string) error {
 	if err := a.loadState(); err != nil {
 		return err
@@ -214,12 +221,24 @@ func (a *Adapter) Mirror(s *session.Session, repoRoot string) error {
 		return err
 	}
 
+	return nil
+}
+
+// Acknowledge advances the per-session capture cursor after the caller has
+// durably committed the mirrored artifacts to the sync repository.
+func (a *Adapter) Acknowledge(sessions []session.Session) error {
+	if err := a.loadState(); err != nil {
+		return err
+	}
 	if a.acknowledged == nil {
 		a.acknowledged = map[string]int64{}
 	}
-	// Acknowledge only after export, copy, metadata write, and state update
-	// all reached this point successfully.
-	a.acknowledged[s.ID] = s.LastModified.UnixMilli()
+	for _, s := range sessions {
+		stamp := s.LastModified.UnixMilli()
+		if stamp > a.acknowledged[s.ID] {
+			a.acknowledged[s.ID] = stamp
+		}
+	}
 	return a.saveState()
 }
 

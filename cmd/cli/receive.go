@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"agentsync/internal/adapter/opencode"
 	"agentsync/internal/receivestate"
@@ -66,6 +67,7 @@ func cmdReceive(args []string) error {
 	}
 	ad := opencode.NewAdapter()
 	attempted := 0
+	blocked := 0
 	for _, ex := range exports {
 		digest, err := artifactDigest(ex.ExportPath)
 		if err != nil {
@@ -101,6 +103,11 @@ func cmdReceive(args []string) error {
 				fmt.Printf("Already processed: %s at %s (%s).\n", ex.SessionID, candidate.LocalPath, previous.Status)
 				continue
 			}
+			if ok && (previous.Status == receivestate.StatusBusy || previous.Status == receivestate.StatusFailed) &&
+				!previous.NextAttempt.IsZero() && time.Now().UTC().Before(previous.NextAttempt) {
+				fmt.Printf("Retry deferred: %s at %s until %s (%s).\n", ex.SessionID, candidate.LocalPath, previous.NextAttempt.UTC().Format(time.RFC3339), previous.Status)
+				continue
+			}
 			paths = append(paths, candidate.LocalPath)
 		}
 		if len(paths) == 0 {
@@ -108,6 +115,7 @@ func cmdReceive(args []string) error {
 		}
 		s := &session.Session{ID: ex.SessionID, Tool: session.ToolOpenCode, CanonicalKey: session.CanonicalKey(ex.Key), PayloadPath: ex.ExportPath}
 		if err := ad.ValidateArtifact(s); err != nil {
+			blocked++
 			fmt.Fprintf(os.Stderr, "receive: action=validate session=%s status=failed error=%q\n", ex.SessionID, err)
 			if !dryRun {
 				for _, path := range paths {
@@ -128,6 +136,8 @@ func cmdReceive(args []string) error {
 	}
 	if dryRun {
 		fmt.Println("Dry run complete; no OpenCode or local receive state was changed.")
+	} else if blocked > 0 {
+		return fmt.Errorf("%d session(s) were blocked before write-back; resolve the reported compatibility or artifact errors and retry", blocked)
 	} else if attempted == 0 {
 		fmt.Println("No pending sessions required write-back.")
 	}

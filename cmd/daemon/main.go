@@ -19,6 +19,7 @@ import (
 
 	"agentsync/internal/adapter/opencode"
 	"agentsync/internal/config"
+	"agentsync/internal/retry"
 	"agentsync/internal/session"
 	"agentsync/internal/syncrepo"
 	"agentsync/internal/watch"
@@ -47,6 +48,14 @@ func run() error {
 	if !repo.Exists() {
 		return fmt.Errorf("sync repo not initialized at %s — run `agent-sync init`", cfg.Sync.RepoPath)
 	}
+	retryPath, err := retry.DefaultPath()
+	if err != nil {
+		return err
+	}
+	retries, err := retry.Open(retryPath)
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -68,12 +77,13 @@ func run() error {
 				} else {
 					logEvent("pull", "poll", "", "", "ok")
 				}
+				retryPendingPush(repo, retries)
 			}
 		}
 	}()
 
 	if cfg.Watch.OpenCode.Enabled {
-		if err := runOpenCodeWatcher(ctx, cfg, repo); err != nil {
+		if err := runOpenCodeWatcher(ctx, cfg, repo, retries); err != nil {
 			return err
 		}
 	} else {
@@ -85,7 +95,7 @@ func run() error {
 }
 
 // runOpenCodeWatcher wires the OpenCode capture adapter into the watch core.
-func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.Repo) error {
+func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.Repo, retries *retry.Store) error {
 	ad := opencode.NewAdapter()
 	// OpenCode stores every project in one database. Evaluate deny policy from
 	// per-session metadata before export, not from the shared DB filename.
@@ -98,15 +108,17 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 		Debounce:  time.Duration(cfg.Sync.DebounceSeconds) * time.Second,
 		DenyGlobs: cfg.Watch.OpenCode.Deny,
 		OnSessions: func(sessions []session.Session) error {
+			mirrored := make([]session.Session, 0, len(sessions))
 			for i := range sessions {
 				if err := ad.Mirror(&sessions[i], repo.Path); err != nil {
 					fmt.Fprintf(os.Stderr, "daemon: mirror %s (%s): %v\n",
 						sessions[i].ID, sessions[i].CanonicalKey, err)
 					continue
 				}
+				mirrored = append(mirrored, sessions[i])
 				logEvent("mirror", string(sessions[i].Tool), string(sessions[i].CanonicalKey), sessions[i].ID, "ok")
 			}
-			if len(sessions) == 0 {
+			if len(mirrored) == 0 {
 				return nil
 			}
 			// One commit covering the debounced batch. A batch that produced
@@ -114,19 +126,29 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 			// is a no-op, not an error — log it and continue rather than
 			// taking down the daemon.
 			ts := time.Now().UTC().Format(time.RFC3339)
-			if _, err := repo.Commit("opencode", batchLabel(sessions), ts); err != nil {
+			if _, err := repo.Commit("opencode", batchLabel(mirrored), ts); err != nil {
 				if errors.Is(err, syncrepo.ErrNoChanges) {
-					logEvent("commit", "opencode", batchLabel(sessions), "", "noop")
-					return nil
+					logEvent("commit", "opencode", batchLabel(mirrored), "", "noop")
+				} else {
+					return fmt.Errorf("commit: %w", err)
 				}
-				return fmt.Errorf("commit: %w", err)
 			}
-			logEvent("commit", "opencode", batchLabel(sessions), "", ts)
+			if err := ad.Acknowledge(mirrored); err != nil {
+				return fmt.Errorf("acknowledge capture: %w", err)
+			}
+			logEvent("commit", "opencode", batchLabel(mirrored), "", ts)
 			if cfg.Sync.Remote != "" {
 				if err := repo.Push(); err != nil {
-					return fmt.Errorf("push: %w (commit was made locally; the daemon will retry on the next change)", err)
+					if scheduleErr := retries.Schedule(retry.OperationPush, "sync-repo", err.Error()); scheduleErr != nil {
+						return fmt.Errorf("push: %w; schedule retry: %v", err, scheduleErr)
+					}
+					logEvent("push", "opencode", batchLabel(mirrored), "", "retry-scheduled")
+					return nil
 				}
-				logEvent("push", "opencode", batchLabel(sessions), "", "ok")
+				if err := retries.Complete(retry.OperationPush, "sync-repo"); err != nil {
+					return fmt.Errorf("clear push retry: %w", err)
+				}
+				logEvent("push", "opencode", batchLabel(mirrored), "", "ok")
 			}
 			return nil
 		},
@@ -137,6 +159,32 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 	fmt.Printf("daemon: watching opencode storage (debounce %ds, deny %v)\n",
 		cfg.Sync.DebounceSeconds, cfg.Watch.OpenCode.Deny)
 	return w.Start(ctx)
+}
+
+func retryPendingPush(repo *syncrepo.Repo, retries *retry.Store) {
+	items, err := retries.Due(time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: load retry state: %v\n", err)
+		return
+	}
+	for _, item := range items {
+		if item.Operation != retry.OperationPush {
+			continue
+		}
+		if err := repo.Push(); err != nil {
+			if scheduleErr := retries.Schedule(retry.OperationPush, item.Key, err.Error()); scheduleErr != nil {
+				fmt.Fprintf(os.Stderr, "daemon: retry push: %v; schedule retry: %v\n", err, scheduleErr)
+			} else {
+				logEvent("push", "sync", item.Key, "", "retry-scheduled")
+			}
+			continue
+		}
+		if err := retries.Complete(item.Operation, item.Key); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon: clear push retry: %v\n", err)
+			continue
+		}
+		logEvent("push", "sync", item.Key, "", "retry-ok")
+	}
 }
 
 // batchLabel summarizes a batch for commit/log messages: "3-sessions" or a

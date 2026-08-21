@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"agentsync/internal/retry"
 )
 
 const (
@@ -28,6 +30,8 @@ type Outcome struct {
 	CandidatePath  string    `json:"candidate_path"`
 	Status         string    `json:"status"`
 	LastAttempt    time.Time `json:"last_attempt"`
+	Attempts       int       `json:"attempts,omitempty"`
+	NextAttempt    time.Time `json:"next_attempt,omitempty"`
 	LastError      string    `json:"last_error,omitempty"`
 }
 
@@ -86,7 +90,19 @@ func (s *Store) Put(outcome Outcome) error {
 	if err != nil {
 		return err
 	}
-	st.Outcomes[Key(outcome.ArtifactDigest, outcome.CandidatePath)] = outcome
+	key := Key(outcome.ArtifactDigest, outcome.CandidatePath)
+	if outcome.Status == StatusBusy || outcome.Status == StatusFailed {
+		previous := st.Outcomes[key]
+		if outcome.Attempts <= previous.Attempts {
+			outcome.Attempts = previous.Attempts + 1
+		}
+		if outcome.NextAttempt.IsZero() {
+			outcome.NextAttempt = outcome.LastAttempt.Add(retry.Backoff(outcome.Attempts))
+		}
+	} else {
+		outcome.NextAttempt = time.Time{}
+	}
+	st.Outcomes[key] = outcome
 	return s.save(st)
 }
 
