@@ -47,20 +47,30 @@ func dbPath() (string, error) {
 }
 
 // Export runs `opencode export <sessionID>` and writes the resulting JSON to
-// outPath. The command writes its JSON document to stdout (log noise goes to
-// stderr), so we capture stdout only.
+// outPath. OpenCode 1.18.18 truncates stdout at 64 KiB when stdout is a pipe,
+// so use a regular file descriptor instead of exec.Cmd's pipe capture.
 func Export(sessionID, outPath string) error {
-	cmd := exec.Command(binName, "export", sessionID)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("opencode export %s: %w: %s", sessionID, err, strings.TrimSpace(stderr.String()))
-	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(outPath, []byte(stdout.String()), 0o600)
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(binName, "export", sessionID)
+	var stderr strings.Builder
+	cmd.Stdout = out
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	closeErr := out.Close()
+	if runErr != nil {
+		return fmt.Errorf("opencode export %s: %w: %s", sessionID, runErr, strings.TrimSpace(stderr.String()))
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return nil
 }
 
 // Import runs `opencode import <exportPath>` using the current process
