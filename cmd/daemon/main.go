@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -108,9 +109,16 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 			if len(sessions) == 0 {
 				return nil
 			}
-			// One commit covering the debounced batch.
+			// One commit covering the debounced batch. A batch that produced
+			// no actual file changes (re-mirrored, already-committed content)
+			// is a no-op, not an error — log it and continue rather than
+			// taking down the daemon.
 			ts := time.Now().UTC().Format(time.RFC3339)
 			if _, err := repo.Commit("opencode", batchLabel(sessions), ts); err != nil {
+				if errors.Is(err, syncrepo.ErrNoChanges) {
+					logEvent("commit", "opencode", batchLabel(sessions), "", "noop")
+					return nil
+				}
 				return fmt.Errorf("commit: %w", err)
 			}
 			logEvent("commit", "opencode", batchLabel(sessions), "", ts)

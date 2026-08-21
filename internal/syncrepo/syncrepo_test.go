@@ -144,6 +144,69 @@ func TestPullFastForward(t *testing.T) {
 	}
 }
 
+func TestPullFastForwardPushCreatedRemote(t *testing.T) {
+	// Reproduce the two-device `agent-sync init` flow: neither device cloned
+	// the remote (so there is no origin/HEAD symref — that only exists on
+	// clone-created remotes), device A pushes, device B must still pull.
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	git(t, t.TempDir(), "init", "--bare", "-q", bare)
+
+	// Device A: init + remote + commit + push (no clone).
+	deviceA := filepath.Join(t.TempDir(), "devA")
+	repoA := Open(deviceA)
+	if err := repoA.Init(); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(deviceA, "x.txt"), []byte("x"), 0o600)
+	if _, err := repoA.Commit("opencode", "s", "2026-08-16T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repoA.SetRemote(bare); err != nil {
+		t.Fatal(err)
+	}
+	if err := repoA.Push(); err != nil {
+		t.Fatalf("device A push should succeed: %v", err)
+	}
+
+	// Device B: init + remote only, no clone → no origin/HEAD.
+	deviceB := filepath.Join(t.TempDir(), "devB")
+	repoB := Open(deviceB)
+	if err := repoB.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repoB.SetRemote(bare); err != nil {
+		t.Fatal(err)
+	}
+	if err := repoB.PullFastForward(); err != nil {
+		t.Fatalf("device B pull should succeed despite no origin/HEAD: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(deviceB, "x.txt")); err != nil {
+		t.Errorf("pulled repo should contain x.txt: %v", err)
+	}
+}
+
+func TestCommitNoChangesReturnsErrNoChanges(t *testing.T) {
+	dir := t.TempDir()
+	repo := Open(dir)
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// First commit creates real content.
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "s1.json"), "{}")
+	if _, err := repo.Commit("opencode", "s1", "2026-08-16T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	// A second commit with no file changes must be a no-op, not a hard error.
+	if _, err := repo.Commit("opencode", "s1", "2026-08-16T00:01:00Z"); err != ErrNoChanges {
+		t.Errorf("expected ErrNoChanges, got %v", err)
+	}
+	// And the repo must still be usable afterwards.
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "s2.json"), "{}")
+	if _, err := repo.Commit("opencode", "s2", "2026-08-16T00:02:00Z"); err != nil {
+		t.Fatalf("repo unusable after no-op commit: %v", err)
+	}
+}
+
 func TestSyncMetaRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	repo := Open(dir)

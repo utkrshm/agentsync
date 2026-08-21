@@ -2,13 +2,21 @@ package syncrepo
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
+
+// ErrNoChanges is returned by Commit when the working tree had nothing new to
+// commit (e.g. a mirror batch whose exported files are byte-identical to what
+// is already committed). Callers must treat it as a no-op, not a failure, and
+// must not push.
+var ErrNoChanges = errors.New("no changes to commit")
 
 // SyncMeta is the per-device metadata stored in the sync repo's working tree
 // (.sync-meta.json). v0.1 keeps it minimal: schema version, device id, and
@@ -54,7 +62,16 @@ func (r *Repo) Init() error {
 	if _, err := r.git("init", "-b", "main"); err != nil {
 		return err
 	}
-	// Ensure .sync-meta.json exists so it's tracked from the start.
+	// .sync-meta.json is device-local state (device id, offsets, caches); it
+	// must never be committed to the shared sync repo. Without the gitignore,
+	// a second device's `pull` would refuse to merge over its own untracked
+	// copy, and one device's meta would clobber another's (docs/CRITIQUE.md
+	// issue 3). The .gitignore itself is tracked and identical everywhere, so
+	// a fast-forward pull over a matching untracked copy succeeds.
+	if err := os.WriteFile(filepath.Join(r.Path, ".gitignore"), []byte(".sync-meta.json\n"), 0o600); err != nil {
+		return err
+	}
+	// Ensure .sync-meta.json exists so it's read/written from the start.
 	if err := r.WriteMeta(SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID()}); err != nil {
 		return err
 	}
@@ -82,6 +99,8 @@ func (r *Repo) HasRemote() bool {
 // version is a monotonically increasing integer; the message format is:
 //
 //	sync: <tool> <session-id> v<version> <ISO-timestamp>
+//
+// If the working tree has nothing new to stage, it returns ErrNoChanges.
 func (r *Repo) Commit(tool, sessionID, ts string) (version int, err error) {
 	if _, err := r.git("add", "-A"); err != nil {
 		return 0, err
@@ -91,7 +110,11 @@ func (r *Repo) Commit(tool, sessionID, ts string) (version int, err error) {
 		return 0, err
 	}
 	msg := fmt.Sprintf("sync: %s %s v%d %s", tool, sessionID, version, ts)
-	if _, err := r.git("commit", "-m", msg); err != nil {
+	out, err := r.git("commit", "-m", msg)
+	if err != nil {
+		if strings.Contains(strings.ToLower(out), "nothing to commit") {
+			return version, ErrNoChanges
+		}
 		return version, err
 	}
 	return version, nil
@@ -131,23 +154,107 @@ func (r *Repo) PullFastForward() error {
 	if _, err := r.git("fetch", "origin"); err != nil {
 		return err
 	}
-	// No remote HEAD (fresh/empty remote) → nothing to pull.
-	if _, err := r.git("rev-parse", "--verify", "origin/HEAD"); err != nil {
-		return nil
+	tip, ok, err := r.remoteTip()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // remote has no branches yet — nothing to pull
 	}
 	// If the remote tip is already an ancestor of local HEAD, we're up to
 	// date or ahead → no merge needed (a `--ff-only` merge would wrongly
 	// error on "not possible to fast-forward" when local is merely ahead).
-	if _, err := r.git("merge-base", "--is-ancestor", "origin/HEAD", "HEAD"); err == nil {
+	if _, err := r.git("merge-base", "--is-ancestor", tip, "HEAD"); err == nil {
 		return nil
 	}
 	// Remote is ahead of local → fast-forward. If it can't, the remote has
 	// diverged from our history → fail loudly, never force-push/auto-merge
 	// (AGENTS.md invariant #9).
-	if _, err := r.git("merge", "--ff-only", "origin/HEAD"); err != nil {
+	if err := r.clearConflictingUntracked(tip); err != nil {
+		return err
+	}
+	if _, err := r.git("merge", "--ff-only", tip); err != nil {
 		return fmt.Errorf("fast-forward merge failed (remote likely diverged): %w", err)
 	}
 	return nil
+}
+
+// clearConflictingUntracked removes untracked working-tree files that the
+// incoming commit would overwrite. A fresh `agent-sync init` leaves a
+// generated, untracked .gitignore behind; when another device has committed
+// the same file, a fast-forward merge refuses to overwrite it even when the
+// content is identical. These are deterministic generated files (git merge has
+// no "overwrite untracked on ff-merge" flag), so removing exactly the
+// conflicting ones is safe — no unrelated local file is touched.
+func (r *Repo) clearConflictingUntracked(tip string) error {
+	out, err := r.git("ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return err
+	}
+	var untracked []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			untracked = append(untracked, line)
+		}
+	}
+	if len(untracked) == 0 {
+		return nil
+	}
+	tree, err := r.git("ls-tree", "-r", "--name-only", tip)
+	if err != nil {
+		return err
+	}
+	incoming := map[string]bool{}
+	for _, line := range strings.Split(tree, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			incoming[line] = true
+		}
+	}
+	for _, f := range untracked {
+		if !incoming[f] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(r.Path, f)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// remoteTip resolves the remote-tracking branch to fast-forward to. It prefers
+// origin/HEAD when the remote advertises one (clone-created remotes); a remote
+// that was pushed into (e.g. after `agent-sync init` + `push HEAD`) has
+// branches but no HEAD symref, so it falls back to an existing remote-tracking
+// branch, preferring main/master. Returns ok=false when the remote has no
+// branches at all.
+func (r *Repo) remoteTip() (string, bool, error) {
+	if _, err := r.git("rev-parse", "--verify", "origin/HEAD"); err == nil {
+		return "origin/HEAD", true, nil
+	}
+	refs, err := r.git("for-each-ref", "--format=%(refname:short)", "refs/remotes/origin")
+	if err != nil {
+		return "", false, err
+	}
+	var branches []string
+	for _, line := range strings.Split(refs, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "origin/HEAD" {
+			continue
+		}
+		branches = append(branches, line)
+	}
+	if len(branches) == 0 {
+		return "", false, nil
+	}
+	for _, pref := range []string{"origin/main", "origin/master"} {
+		for _, b := range branches {
+			if b == pref {
+				return b, true, nil
+			}
+		}
+	}
+	sort.Strings(branches)
+	return branches[0], true, nil
 }
 
 // PullForced is the synchronous pre-write-back pull (SPEC-DOC.md §5.2,
