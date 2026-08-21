@@ -118,9 +118,10 @@ func pickSession(sessions []sessionEntry) (int, error) {
 	return n - 1, nil
 }
 
-// launchOpenCode runs `opencode resume <id>`, inheriting stdio.
+// launchOpenCode runs `opencode -s <id>`, inheriting stdio. (opencode
+// 1.18.x removed the `resume` subcommand; `-s/--session` is its replacement.)
 func launchOpenCode(sessionID string) error {
-	cmd := exec.Command("opencode", "resume", sessionID)
+	cmd := exec.Command("opencode", "-s", sessionID)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

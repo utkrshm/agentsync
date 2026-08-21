@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -75,6 +76,10 @@ func cmdSend(args []string) error {
 	ts := time.Now().UTC().Format(time.RFC3339)
 	version, err := repo.Commit("opencode", sessionID, ts)
 	if err != nil {
+		if errors.Is(err, syncrepo.ErrNoChanges) {
+			fmt.Println("Already synced; nothing to commit.")
+			return nil
+		}
 		return fmt.Errorf("commit: %w", err)
 	}
 	fmt.Printf("Committed v%d: sync: opencode %s v%d %s\n", version, sessionID, version, ts)
