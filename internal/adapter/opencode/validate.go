@@ -3,6 +3,9 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 // ValidateExport checks an in-memory export payload before it is written
@@ -53,4 +56,53 @@ func parseExportInfo(data []byte) (ExportInfo, error) {
 		return ExportInfo{}, fmt.Errorf("parse export info: %w", err)
 	}
 	return doc.Info, nil
+}
+
+// CheckArtifactFile gates one working-tree file under opencode/ before the
+// sync repo commits it. AgentSync writes only two shapes; anything else in
+// the payload tree (hand-edited JSON, editor droppings, corrupted exports)
+// must never enter shared history where receive would later trip over it.
+//
+// Recognized locations and their contracts:
+//
+//	opencode/<project>/export/<session-id>.json      full export: ValidateExport
+//	opencode/<project>/import-meta/<session-id>.json sidecar: valid JSON, id == stem
+//
+// The filename stem must equal the session id recorded inside for both.
+// Locations that match neither shape are rejected outright.
+func CheckArtifactFile(absPath, relPath string) error {
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	if len(parts) != 4 || parts[0] != "opencode" {
+		return fmt.Errorf(
+			"unexpected location %s (want opencode/<project>/(export|import-meta)/<session-id>.json)",
+			relPath)
+	}
+	name := parts[3]
+	stem := strings.TrimSuffix(name, ".json")
+	if stem == "" || stem == name {
+		return fmt.Errorf("%s: expected a .json file named after its session id", relPath)
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return err
+	}
+	switch parts[2] {
+	case "export":
+		if _, verr := ValidateExport(data, stem); verr != nil {
+			return verr
+		}
+	case "import-meta":
+		var m struct {
+			ID string `json:"id"`
+		}
+		if !json.Valid(data) || json.Unmarshal(data, &m) != nil {
+			return fmt.Errorf("import-meta %s: not valid JSON", relPath)
+		}
+		if m.ID != stem {
+			return fmt.Errorf("import-meta %s: id %q does not match filename", relPath, m.ID)
+		}
+	default:
+		return fmt.Errorf("unrecognized opencode/ subdirectory %q — expected export or import-meta", parts[2])
+	}
+	return nil
 }

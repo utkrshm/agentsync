@@ -489,3 +489,81 @@ func TestInitUsesInjectedDeviceID(t *testing.T) {
 		t.Errorf("expected injected device id, got %q", m.DeviceID)
 	}
 }
+
+func TestCommitSkipsInvalidArtifactsAndWarns(t *testing.T) {
+	dir := t.TempDir()
+	repo := Open(dir)
+	stubDeviceID(t, "dev-test")
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "good.json"),
+		`{"info":{"id":"good","projectID":"p","directory":"/d","version":"1.0"}}`)
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "junk.json"),
+		`{"not":"a session export"}`)
+	repo.ValidateArtifact = func(absPath, relPath string) error {
+		if strings.Contains(relPath, "junk") {
+			return errors.New("not an agent-sync export")
+		}
+		return nil
+	}
+	warnings := captureWarnings(repo)
+
+	version, err := repo.Commit("opencode", "good", "2026-08-22T00:00:00Z")
+	if err != nil {
+		t.Fatalf("commit with one invalid artifact should still succeed: %v", err)
+	}
+	if version != 1 {
+		t.Errorf("first commit should be v1, got v%d", version)
+	}
+	names := git(t, dir, "show", "--name-only", "--format=")
+	for _, n := range strings.Split(names, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(n), "junk.json") {
+			t.Errorf("invalid artifact must not be committed; got %q", names)
+		}
+	}
+	if !strings.Contains(names, "opencode/k/export/good.json") {
+		t.Errorf("valid artifact missing from commit: %q", names)
+	}
+	if w := warnings(); !strings.Contains(w, "junk.json") || !strings.Contains(w, "skipping invalid sync artifact") {
+		t.Errorf("expected a warning naming junk.json, got %q", w)
+	}
+	// The rejected file stays on disk untouched.
+	data, err := os.ReadFile(filepath.Join(dir, "opencode", "k", "export", "junk.json"))
+	if err != nil || string(data) != `{"not":"a session export"}` {
+		t.Errorf("invalid artifact must not be deleted or modified: %q err=%v", data, err)
+	}
+}
+
+func TestCommitStagesArtifactDeletionsWithoutValidation(t *testing.T) {
+	dir := t.TempDir()
+	repo := Open(dir)
+	stubDeviceID(t, "dev-test")
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "opencode", "k", "export", "gone.json")
+	writeFile(t, p, `{"info":{"id":"gone","projectID":"p","directory":"/d","version":"1.0"}}`)
+	if _, err := repo.Commit("opencode", "gone", "2026-08-22T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	// Delete locally without validation being possible (file is gone).
+	calls := 0
+	repo.ValidateArtifact = func(absPath, relPath string) error {
+		calls++
+		return fmt.Errorf("validator must not run for deletions")
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Commit("opencode", "gone", "2026-08-22T00:01:00Z"); err != nil {
+		t.Fatalf("commit recording a deletion should succeed: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("validator ran %d times for deletion entries", calls)
+	}
+	names := git(t, dir, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(names, "opencode/k/export/gone.json") {
+		t.Errorf("deletion of artifact missing from commit: %q", names)
+	}
+}

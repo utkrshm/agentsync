@@ -55,6 +55,7 @@ func run() error {
 	}
 
 	repo := syncrepo.Open(cfg.Sync.RepoPath)
+	repo.ValidateArtifact = opencode.CheckArtifactFile
 	if !repo.Exists() {
 		return fmt.Errorf("sync repo not initialized at %s — run `agent-sync init`", cfg.Sync.RepoPath)
 	}

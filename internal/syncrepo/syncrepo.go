@@ -63,6 +63,14 @@ type Repo struct {
 	// Commit deliberately skips). Injectable like every other shell-out point;
 	// nil falls back to writing to os.Stderr.
 	Warnf func(format string, args ...any)
+
+	// ValidateArtifact, when non-nil, gates every changed file staged under
+	// payloadPrefix: returning an error excludes the file from the commit
+	// (warned, never deleted). absPath is the working-tree path; relPath is
+	// slash-separated and repo-relative. Deletions are exempt — there is no
+	// content left to validate, and recording a stale artifact's removal
+	// still matters.
+	ValidateArtifact func(absPath, relPath string) error
 }
 
 // Open returns a Repo for the given working-tree path.
@@ -91,15 +99,24 @@ func (r *Repo) Exists() bool {
 	return err == nil
 }
 
-// git runs `git -C r.Path <args...>` and returns combined output.
+// git runs `git -C r.Path <args...>` and returns trimmed combined output.
 func (r *Repo) git(args ...string) (string, error) {
+	out, err := r.gitRaw(args...)
+	return strings.TrimSpace(out), err
+}
+
+// gitRaw runs git like Repo.git but returns the output verbatim. Porcelain
+// consumers need this: `git status --porcelain` encodes state in fixed
+// columns, and trimming strips the leading space of worktree-only entries
+// (" D path"), shifting every parsed field one character left.
+func (r *Repo) gitRaw(args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", r.Path}, args...)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return strings.TrimSpace(string(out)), fmt.Errorf("git %s: %w: %s",
+		return string(out), fmt.Errorf("git %s: %w: %s",
 			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return string(out), nil
 }
 
 // Init creates the working tree directory, initializes a git repo, and sets
@@ -186,36 +203,88 @@ func (r *Repo) Commit(tool, sessionID, ts string) (version int, err error) {
 	return version, nil
 }
 
-// stageSyncOwned runs `git add -A -- opencode .gitignore`. Git errors when a
-// pathspec matches nothing (e.g. before Init has written .gitignore or any
-// payload exists), so on failure fall back to adding each allowlisted path
-// that actually exists.
+// stageSyncOwned stages exactly the sync-owned paths git reports as changed,
+// filtered through ValidateArtifact when set. Staging explicit paths (rather
+// than blanket-adding the opencode/ directory) keeps files that fail
+// validation out of the index entirely, so hand-placed or corrupt files
+// inside the payload tree never reach the shared history.
 func (r *Repo) stageSyncOwned() error {
-	if _, err := r.git("add", "-A", "--", strings.TrimSuffix(payloadPrefix, "/"), gitignorePath); err == nil {
+	paths := r.syncOwnedChanges()
+	if len(paths) == 0 {
 		return nil
 	}
-	for _, p := range []string{strings.TrimSuffix(payloadPrefix, "/"), gitignorePath} {
-		if _, err := os.Stat(filepath.Join(r.Path, p)); err != nil {
+	args := append([]string{"add", "-A", "--"}, paths...)
+	_, err := r.git(args...)
+	return err
+}
+
+// syncOwnedChanges lists changed/untracked allowlisted paths from git status
+// --porcelain scoped to the allowlist. Under payloadPrefix each file passes
+// through ValidateArtifact; failures are warned and excluded — never deleted
+// or staged. Deletions pass unvalidated (nothing left to check). On a status
+// failure it falls back to the blanket add: a plumbing error must not
+// silently skip syncing real artifacts.
+func (r *Repo) syncOwnedChanges() []string {
+	out, err := r.gitRaw("status", "--porcelain", "--untracked-files=all", "--",
+		strings.TrimSuffix(payloadPrefix, "/"), gitignorePath)
+	if err != nil {
+		r.warn("sync staging: git status failed (%v); staging whole allowlist without per-file validation", err)
+		if _, addErr := r.git("add", "-A", "--", strings.TrimSuffix(payloadPrefix, "/"), gitignorePath); addErr != nil {
+			r.warn("sync staging: blanket git add failed: %v", addErr)
+		}
+		return nil
+	}
+	var add []string
+	consider := func(rel string, deletion bool) {
+		if rel == "" || !allowlisted(rel) {
+			return
+		}
+		if !deletion && r.ValidateArtifact != nil {
+			abs := filepath.Join(r.Path, filepath.FromSlash(rel))
+			if verr := r.ValidateArtifact(abs, rel); verr != nil {
+				r.warn("skipping invalid sync artifact: %s (%v)", rel, verr)
+				return
+			}
+		}
+		add = append(add, rel)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		if _, err := r.git("add", "-A", "--", p); err != nil {
-			return err
+		if len(line) < 4 {
+			continue
 		}
+		body := line[3:] // XY<space> then path
+		if i := strings.Index(body, " -> "); i >= 0 {
+			consider(strings.TrimSpace(body[:i]), true)    // old side: content gone
+			consider(strings.TrimSpace(body[i+4:]), false) // new side validated
+			continue
+		}
+		consider(body, isDeletion(line))
 	}
-	return nil
+	return add
+}
+
+// isDeletion reports whether a porcelain status line marks a deleted path in
+// the index or worktree (X or Y is 'D').
+func isDeletion(line string) bool {
+	if len(line) < 2 {
+		return false
+	}
+	return line[0] == 'D' || line[1] == 'D'
 }
 
 // warnForeignPaths surfaces modified/untracked working-tree paths outside the
 // sync-owned allowlist without failing the commit. Ignored files (e.g.
 // .sync-meta.json) never appear in porcelain output.
 func (r *Repo) warnForeignPaths() {
-	out, err := r.git("status", "--porcelain")
+	out, err := r.gitRaw("status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return
 	}
 	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		rel := porcelainPath(line)
@@ -226,15 +295,14 @@ func (r *Repo) warnForeignPaths() {
 	}
 }
 
-// porcelainPath extracts the repo-relative path from a `git status
-// --porcelain` entry, handling the rename form "R  old -> new" by returning
-// the new path (the one that would be staged).
+// porcelainPath extracts the repo-relative path from a raw
+// `git status --porcelain` entry (format: XY<space><path>), handling the
+// rename form "R  old -> new" by returning the new path.
 func porcelainPath(line string) string {
-	// Format: XY <path>; XY is two status bytes followed by one space.
-	body := line
-	if len(body) > 3 && body[2] == ' ' {
-		body = body[3:]
+	if len(line) < 4 {
+		return ""
 	}
+	body := line[3:] // skip XY and the separating space
 	if i := strings.Index(body, " -> "); i >= 0 {
 		return body[i+4:]
 	}
