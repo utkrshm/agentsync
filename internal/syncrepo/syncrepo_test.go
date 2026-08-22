@@ -441,3 +441,51 @@ func TestPullFastForwardRefusesForeignUntrackedConflict(t *testing.T) {
 		t.Errorf("foreign-conflict failure must not be misreported as divergence: %v", pushErr)
 	}
 }
+
+// stubDeviceID swaps in a fixed durable identity for the duration of a test
+// so meta assertions are deterministic and the real per-user config dir is
+// never touched.
+func stubDeviceID(t *testing.T, id string) {
+	t.Helper()
+	prev := loadDeviceID
+	loadDeviceID = func() (string, error) { return id, nil }
+	t.Cleanup(func() { loadDeviceID = prev })
+}
+
+func TestTouchMetaBackfillsDurableDeviceID(t *testing.T) {
+	stubDeviceID(t, "11111111-2222-4333-8444-555555555555")
+	dir := t.TempDir()
+	repo := Open(dir)
+	// Pre-existing meta carrying a legacy dev-<unixnano> identity.
+	writeFile(t, filepath.Join(dir, ".sync-meta.json"),
+		`{"schema_version":1,"device_id":"dev-1750000000000"}`)
+
+	if err := repo.TouchMeta(); err != nil {
+		t.Fatalf("TouchMeta with legacy id: %v", err)
+	}
+	m, err := repo.ReadMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.DeviceID != "11111111-2222-4333-8444-555555555555" {
+		t.Errorf("legacy device id should be replaced by the durable one, got %q", m.DeviceID)
+	}
+	if m.SchemaVersion != 1 {
+		t.Errorf("expected schema version 1, got %d", m.SchemaVersion)
+	}
+}
+
+func TestInitUsesInjectedDeviceID(t *testing.T) {
+	stubDeviceID(t, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+	repo := Open(t.TempDir())
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	m, err := repo.ReadMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.DeviceID != "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
+		t.Errorf("expected injected device id, got %q", m.DeviceID)
+	}
+}

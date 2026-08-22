@@ -40,6 +40,11 @@ func allowlisted(rel string) bool {
 	return rel == gitignorePath || strings.HasPrefix(rel, payloadPrefix)
 }
 
+// loadDeviceID resolves this device's durable identity. Package-level var so
+// tests can inject a fixed value instead of touching the real per-user
+// config directory.
+var loadDeviceID = deviceid.LoadOrCreate
+
 // SyncMeta is the per-device metadata stored in the sync repo's working tree
 // (.sync-meta.json). v0.1 keeps it minimal: schema version, device id, and
 // the set of session IDs this device has already imported (so `receive` only
@@ -118,7 +123,7 @@ func (r *Repo) Init() error {
 	// Ensure .sync-meta.json exists so it's read/written from the start.
 	// The device id comes from the durable per-device identity file
 	// (internal/deviceid) so it survives meta corruption across devices.
-	deviceID, err := deviceid.LoadOrCreate()
+	deviceID, err := loadDeviceID()
 	if err != nil {
 		return fmt.Errorf("load device id: %w", err)
 	}
@@ -434,8 +439,12 @@ func (r *Repo) WriteMeta(m SyncMeta) error {
 	return os.WriteFile(filepath.Join(r.Path, ".sync-meta.json"), data, 0o600)
 }
 
-// TouchMeta ensures .sync-meta.json exists with a stable device identity,
-// regenerating only what is missing (never an existing valid device id).
+// TouchMeta ensures .sync-meta.json exists and carries this device's durable
+// identity. Ids written before internal/deviceid existed (dev-<unixnano>)
+// were regenerated whenever the meta file went missing, silently splitting
+// one physical device into several identities — so TouchMeta replaces any
+// legacy value with the durable id on touch. This also guarantees the
+// device-id file itself exists after any command that touches meta.
 func (r *Repo) TouchMeta() error {
 	m, err := r.ReadMeta()
 	if err != nil {
@@ -443,12 +452,10 @@ func (r *Repo) TouchMeta() error {
 		m = SyncMeta{SchemaVersion: 1}
 	}
 	m.SchemaVersion = 1
-	if m.DeviceID == "" {
-		deviceID, err := deviceid.LoadOrCreate()
-		if err != nil {
-			return fmt.Errorf("load device id: %w", err)
-		}
-		m.DeviceID = deviceID
+	deviceID, err := loadDeviceID()
+	if err != nil {
+		return fmt.Errorf("load device id: %w", err)
 	}
+	m.DeviceID = deviceID
 	return r.WriteMeta(m)
 }
