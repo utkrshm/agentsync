@@ -16,6 +16,7 @@ type Config struct {
 	Sync      Sync        `toml:"sync"`
 	Watch     WatchConfig `toml:"watch"`
 	RepoIndex RepoIndex   `toml:"repoindex"`
+	Producer  Producer    `toml:"producer"`
 }
 
 type Sync struct {
@@ -50,6 +51,15 @@ type RepoIndex struct {
 	// Empty means the index is not configured — write-back can't locate local
 	// clones until the user sets these (the privacy/speed boundary, §4.1).
 	Roots []string `toml:"roots"`
+}
+
+// Producer configures provenance checks on the tool binary that performs
+// write-back. All checks are device-local: they observe this device's
+// producer binary and are never stored in or derived from the sync repo.
+type Producer struct {
+	// TrustedPath pins the expected absolute path of the opencode binary.
+	// Empty disables the pin: any resolved path is allowed.
+	TrustedPath string `toml:"trusted_opencode_path"`
 }
 
 const (

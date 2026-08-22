@@ -97,6 +97,9 @@ func run() error {
 // runOpenCodeWatcher wires the OpenCode capture adapter into the watch core.
 func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.Repo, retries *retry.Store) error {
 	ad := opencode.NewAdapter()
+	// Provenance config is wired even though the daemon only captures: any
+	// future write-back path through this adapter must honor the same pin.
+	ad.TrustedPath = cfg.Producer.TrustedPath
 	// OpenCode stores every project in one database. Evaluate deny policy from
 	// per-session metadata before export, not from the shared DB filename.
 	ad.ShouldCapture = func(localPath string, key session.CanonicalKey) bool {

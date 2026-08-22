@@ -16,12 +16,40 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
 
 // binName is the OpenCode CLI binary name on PATH.
 const binName = "opencode"
+
+var (
+	binPathOnce sync.Once
+	binPathVal  string
+	binPathErr  error
+)
+
+// BinaryPath resolves the absolute path of the opencode executable via
+// exec.LookPath and caches the result for the lifetime of the process. All
+// exec sites go through it so provenance checks (trusted_opencode_path,
+// producer fingerprints) see exactly the binary that would run.
+func BinaryPath() (string, error) {
+	binPathOnce.Do(func() {
+		binPathVal, binPathErr = exec.LookPath(binName)
+	})
+	return binPathVal, binPathErr
+}
+
+// binCmd builds an exec.Cmd for the opencode CLI pinned to its resolved
+// absolute path instead of relying on PATH lookup at spawn time.
+func binCmd(args ...string) (*exec.Cmd, error) {
+	path, err := BinaryPath()
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s binary: %w", binName, err)
+	}
+	return exec.Command(path, args...), nil
+}
 
 // DataDir returns the OpenCode data directory, resolved per Phase 0 findings:
 // $XDG_DATA_HOME/opencode when XDG_DATA_HOME is set, else ~/.local/share/opencode.
@@ -50,6 +78,10 @@ func dbPath() (string, error) {
 // outPath. OpenCode 1.18.18 truncates stdout at 64 KiB when stdout is a pipe,
 // so use a regular file descriptor instead of exec.Cmd's pipe capture.
 func Export(sessionID, outPath string) error {
+	cmd, err := binCmd("export", sessionID)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
 		return err
 	}
@@ -58,7 +90,6 @@ func Export(sessionID, outPath string) error {
 		return err
 	}
 
-	cmd := exec.Command(binName, "export", sessionID)
 	var stderr strings.Builder
 	cmd.Stdout = out
 	cmd.Stderr = &stderr
@@ -84,7 +115,10 @@ func Import(exportPath string) error {
 // derives project context from its invocation directory, so omitting Cmd.Dir
 // makes cross-device write-back target-dependent by accident.
 func ImportInto(exportPath, targetDir string) error {
-	cmd := exec.Command(binName, "import", exportPath)
+	cmd, err := binCmd("import", exportPath)
+	if err != nil {
+		return err
+	}
 	if targetDir != "" {
 		cmd.Dir = targetDir
 	}
@@ -98,7 +132,10 @@ func ImportInto(exportPath, targetDir string) error {
 // ToolVersion returns the installed OpenCode version for write-back
 // compatibility checks.
 func ToolVersion() (string, error) {
-	cmd := exec.Command(binName, "--version")
+	cmd, err := binCmd("--version")
+	if err != nil {
+		return "", err
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("opencode --version: %w: %s", err, strings.TrimSpace(string(out)))

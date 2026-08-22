@@ -58,6 +58,9 @@ type Adapter struct {
 	// ToolVersion returns the installed OpenCode version for fail-closed
 	// compatibility checks before write-back.
 	ToolVersion func() (string, error)
+	// BinaryPath resolves the absolute path of the opencode executable that
+	// all exec sites use (default caches per process).
+	BinaryPath func() (string, error)
 	// VerifyImport confirms the imported session is associated with targetDir.
 	VerifyImport func(exportPath, targetDir string) error
 	// ShouldCapture applies deny policy after resolving session metadata but
@@ -65,6 +68,12 @@ type Adapter struct {
 	ShouldCapture func(localPath string, key session.CanonicalKey) bool
 	// StateFile is the path to the per-session capture state file.
 	StateFile func() (string, error)
+
+	// TrustedPath, when non-empty, pins the allowed absolute opencode binary
+	// path; ValidateArtifact refuses write-back when resolution differs.
+	// Populated by callers from config.Producer.TrustedPath — the adapter
+	// package does not import internal/config.
+	TrustedPath string
 
 	acknowledged map[string]int64
 	stateLoaded  bool
@@ -87,6 +96,7 @@ func NewAdapter() *Adapter {
 		PatchImport:  PatchImport,
 		ProcessGuard: IsToolRunning,
 		ToolVersion:  ToolVersion,
+		BinaryPath:   BinaryPath,
 		VerifyImport: VerifyImport,
 		StateFile:    stateFilePath,
 	}
@@ -303,7 +313,10 @@ func stateFilePath() (string, error) {
 // dbQuery runs a read-only SQL query through opencode's own `db` command and
 // returns its JSON output. No direct DB file access (invariant #4).
 func dbQuery(sql string) ([]byte, error) {
-	cmd := exec.Command(binName, "db", sql, "--format", "json")
+	cmd, err := binCmd("db", sql, "--format", "json")
+	if err != nil {
+		return nil, err
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		var stderr strings.Builder

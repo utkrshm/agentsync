@@ -3,6 +3,7 @@ package opencode
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"agentsync/internal/session"
 )
@@ -32,6 +33,26 @@ func (a *Adapter) ValidateArtifact(s *session.Session) error {
 	}
 	if normalizeVersion(installed) != normalizeVersion(info.Version) {
 		return fmt.Errorf("OpenCode version mismatch: export is %s, installed is %s; refusing write-back", info.Version, installed)
+	}
+	return a.checkTrustedBinary()
+}
+
+// checkTrustedBinary refuses write-back when the resolved opencode binary
+// differs from the configured trusted_opencode_path pin. An empty pin
+// disables the check entirely (BinaryPath may then even be unconfigured).
+func (a *Adapter) checkTrustedBinary() error {
+	if a.TrustedPath == "" {
+		return nil
+	}
+	if a.BinaryPath == nil {
+		return fmt.Errorf("trusted_opencode_path is set but binary resolution is not configured; refusing write-back")
+	}
+	resolved, err := a.BinaryPath()
+	if err != nil {
+		return fmt.Errorf("opencode not found on PATH but trusted_opencode_path is %s — refusing write-back: %w", a.TrustedPath, err)
+	}
+	if filepath.Clean(resolved) != filepath.Clean(a.TrustedPath) {
+		return fmt.Errorf("opencode resolved to %s but trusted_opencode_path is %s — refusing write-back; fix PATH or update config", resolved, a.TrustedPath)
 	}
 	return nil
 }
