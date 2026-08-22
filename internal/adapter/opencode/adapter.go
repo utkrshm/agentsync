@@ -22,7 +22,9 @@ import (
 	"strings"
 	"time"
 
+	"agentsync/internal/artifact"
 	"agentsync/internal/canonicalkey"
+	"agentsync/internal/fsutil"
 	"agentsync/internal/session"
 )
 
@@ -76,6 +78,10 @@ type Adapter struct {
 	ShouldCapture func(localPath string, key session.CanonicalKey) bool
 	// StateFile is the path to the per-session capture state file.
 	StateFile func() (string, error)
+	// Store persists mirrored artifacts into the sync repo atomically.
+	// Zero value is the plain disk store; injectable so a future layer can
+	// wrap the write path without touching Mirror.
+	Store artifact.Store
 
 	// TrustedPath, when non-empty, pins the allowed absolute opencode binary
 	// path; ValidateArtifact refuses write-back when resolution differs.
@@ -214,34 +220,34 @@ func (a *Adapter) exportOne(c changedSession, key session.CanonicalKey) (*sessio
 	}, nil
 }
 
-// Mirror implements session.Adapter: copy the export into the sync repo
-// layout and write the receive-side import-meta. Capture acknowledgement is a
-// separate operation because the daemon must not advance its cursor until the
-// sync-repo commit succeeds.
+// Mirror implements session.Adapter: validate the export payload, copy it
+// into the sync repo layout atomically, and write the receive-side
+// import-meta. The payload is read once and validated before anything is
+// written — a truncated or mismatched export leaves no file under the
+// destination path. Capture acknowledgement is a separate operation because
+// the daemon must not advance its cursor until the sync-repo commit succeeds.
 func (a *Adapter) Mirror(s *session.Session, repoRoot string) error {
 	if err := a.loadState(); err != nil {
 		return err
 	}
-	rel := filepath.Join("opencode", string(s.CanonicalKey), "export", s.ID+".json")
-	dest := filepath.Join(repoRoot, rel)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return err
+	payload, err := os.ReadFile(s.PayloadPath)
+	if err != nil {
+		return fmt.Errorf("read export payload %s: %w", s.PayloadPath, err)
 	}
-	if err := copyFile(s.PayloadPath, dest); err != nil {
-		return err
-	}
-	s.PayloadPath = filepath.Join(repoRoot, rel)
-
-	// Write import-meta so `receive` can apply the project_id/directory patch.
-	info, err := readExportInfo(dest)
+	info, err := ValidateExport(payload, s.ID)
 	if err != nil {
 		return err
 	}
-	metaPath := filepath.Join(repoRoot, "opencode", string(s.CanonicalKey), "import-meta", s.ID+".json")
-	if err := os.MkdirAll(filepath.Dir(metaPath), 0o700); err != nil {
+	dest := filepath.Join(repoRoot, "opencode", string(s.CanonicalKey), "export", s.ID+".json")
+	if _, err := a.Store.Write(dest, payload); err != nil {
 		return err
 	}
-	if err := writeImportMeta(metaPath, info); err != nil {
+	s.PayloadPath = dest
+
+	// Write import-meta so `receive` can apply the project_id/directory patch,
+	// built from the same parsed info as the stored export.
+	metaPath := filepath.Join(repoRoot, "opencode", string(s.CanonicalKey), "import-meta", s.ID+".json")
+	if err := WriteImportMeta(metaPath, info); err != nil {
 		return err
 	}
 
@@ -302,9 +308,6 @@ func (a *Adapter) saveState() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
 	if a.acknowledged == nil {
 		a.acknowledged = map[string]int64{}
 	}
@@ -312,7 +315,7 @@ func (a *Adapter) saveState() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o600)
+	return fsutil.AtomicWriteFile(p, data, 0o600)
 }
 
 // stateFilePath is the default per-device watermark location.

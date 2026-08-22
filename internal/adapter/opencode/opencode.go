@@ -9,7 +9,6 @@ package opencode
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -188,22 +187,11 @@ type ExportInfo struct {
 
 // readExportInfo parses just the `info` field of an export JSON file.
 func readExportInfo(path string) (ExportInfo, error) {
-	var doc struct {
-		Info ExportInfo `json:"info"`
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ExportInfo{}, err
 	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return ExportInfo{}, fmt.Errorf("parse export %s: %w", path, err)
-	}
-	return doc.Info, nil
-}
-
-// ReadExportInfo is the exported accessor for parsing an export file's info.
-func ReadExportInfo(path string) (ExportInfo, error) {
-	return readExportInfo(path)
+	return parseExportInfo(data)
 }
 
 // PatchImport fixes the project_id and directory of an imported session so it

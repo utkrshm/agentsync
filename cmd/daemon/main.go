@@ -25,6 +25,10 @@ import (
 	"agentsync/internal/watch"
 )
 
+// staleTempMaxAge bounds how long an unclaimed export temp payload may live
+// before the startup sweep removes it.
+const staleTempMaxAge = 24 * time.Hour
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "agent-sync daemon: %v\n", err)
@@ -42,6 +46,12 @@ func run() error {
 	}
 	if cfg.Sync.RepoPath == "" {
 		cfg.Sync.RepoPath = config.DefaultRepoPath()
+	}
+
+	// Clean up export temp payloads leaked by earlier crashed runs (they hold
+	// session transcripts; do not let them accumulate).
+	if n := opencode.SweepStaleTemps(staleTempMaxAge); n > 0 {
+		fmt.Printf("daemon: removed %d stale export temp file(s)\n", n)
 	}
 
 	repo := syncrepo.Open(cfg.Sync.RepoPath)
@@ -113,13 +123,18 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 		DenyGlobs: cfg.Watch.OpenCode.Deny,
 		OnSessions: func(sessions []session.Session) error {
 			mirrored := make([]session.Session, 0, len(sessions))
+			// Mirror replaces PayloadPath with the repo destination, so the
+			// temp payload paths must be captured before mirroring.
+			temps := make([]string, 0, len(sessions))
 			for i := range sessions {
+				tempPayload := sessions[i].PayloadPath
 				if err := ad.Mirror(&sessions[i], repo.Path); err != nil {
 					fmt.Fprintf(os.Stderr, "daemon: mirror %s (%s): %v\n",
 						sessions[i].ID, sessions[i].CanonicalKey, err)
 					continue
 				}
 				mirrored = append(mirrored, sessions[i])
+				temps = append(temps, tempPayload)
 				logEvent("mirror", string(sessions[i].Tool), string(sessions[i].CanonicalKey), sessions[i].ID, "ok")
 			}
 			if len(mirrored) == 0 {
@@ -139,6 +154,15 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 			}
 			if err := ad.Acknowledge(mirrored); err != nil {
 				return fmt.Errorf("acknowledge capture: %w", err)
+			}
+			// Only after the artifacts are durably committed and the capture
+			// cursor advanced are the temp payloads disposable.
+			for _, tp := range temps {
+				if err := os.Remove(tp); err != nil && !os.IsNotExist(err) {
+					fmt.Fprintf(os.Stderr, "daemon: remove temp payload %s: %v\n", tp, err)
+					continue
+				}
+				logEvent("cleanup-temp", "opencode", "", "", "ok")
 			}
 			logEvent("commit", "opencode", batchLabel(mirrored), "", ts)
 			if cfg.Sync.Remote != "" {

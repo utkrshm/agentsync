@@ -3,10 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 
-	"agentsync/internal/adapter/opencode"
 	"agentsync/internal/config"
 )
 
@@ -28,37 +26,6 @@ func requireConfig() (config.Config, error) {
 // configFilePath returns the config file location.
 func configFilePath() (string, error) {
 	return config.Path()
-}
-
-// readExportInfoFrom is a thin wrapper over the opencode adapter's parser so
-// the CLI doesn't import it directly with a hidden name.
-func readExportInfoFrom(path string) (opencode.ExportInfo, error) {
-	return opencode.ReadExportInfo(path)
-}
-
-// copyFile copies src to dst (permissions: owner rw).
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
-
-// writeImportMeta writes the receive-side patch metadata for a session.
-func writeImportMeta(path string, info opencode.ExportInfo) error {
-	data, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o600)
 }
 
 // importMeta describes what a synced session needs for the import patch.

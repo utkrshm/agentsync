@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentsync/internal/adapter/opencode"
+	"agentsync/internal/artifact"
 	"agentsync/internal/canonicalkey"
 	"agentsync/internal/syncrepo"
 )
@@ -28,7 +29,7 @@ func cmdSend(args []string) error {
 		return fmt.Errorf("sync repo not initialized at %s — run `agent-sync init`", cfg.Sync.RepoPath)
 	}
 
-	// Export to a temp file first so we can read its canonical key + info.
+	// Export to a temp file first so a killed export never lands in the repo.
 	tmp, err := os.CreateTemp("", "agentsync-export-*.json")
 	if err != nil {
 		return err
@@ -41,29 +42,30 @@ func cmdSend(args []string) error {
 		return err
 	}
 
-	info, err := readExportInfoFrom(tmpPath)
+	// Read the payload once, validate it before anything durable is written.
+	payload, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return err
+	}
+	info, err := opencode.ValidateExport(payload, sessionID)
 	if err != nil {
 		return err
 	}
 	// Resolve canonical key from the session's source project directory.
 	key := canonicalkey.Resolve(info.Directory)
 
-	// Layout: <sync-repo>/opencode/<key>/export/<id>.json
+	// Layout: <sync-repo>/opencode/<key>/export/<id>.json — written atomically,
+	// so no partial file is ever observable at the final path.
+	var store artifact.Store
 	rel := filepath.Join("opencode", string(key), "export", sessionID+".json")
 	dest := filepath.Join(repo.Path, rel)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return err
-	}
-	if err := copyFile(tmpPath, dest); err != nil {
+	if _, err := store.Write(dest, payload); err != nil {
 		return err
 	}
 
 	// Write import-meta for the receive-side patch.
 	metaPath := filepath.Join(repo.Path, "opencode", string(key), "import-meta", sessionID+".json")
-	if err := os.MkdirAll(filepath.Dir(metaPath), 0o700); err != nil {
-		return err
-	}
-	if err := writeImportMeta(metaPath, info); err != nil {
+	if err := opencode.WriteImportMeta(metaPath, info); err != nil {
 		return err
 	}
 
