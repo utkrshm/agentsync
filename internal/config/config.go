@@ -21,6 +21,10 @@ type Config struct {
 type Sync struct {
 	RepoPath string `toml:"repo_path"` // absolute path of the sync repo working tree
 	Remote   string `toml:"remote"`    // e.g. git@github.com:user/agent-sessions.git
+	// DeviceAlias is a display-only human label for this device (shown in
+	// summaries/logs). It is never part of identity: identity is the durable
+	// UUID managed by internal/deviceid.
+	DeviceAlias string `toml:"device_alias"`
 	// DebounceSeconds is how long the watcher waits after the last event on a
 	// file before firing OnChange (IMPLEMENTATION-PLAN.md §3).
 	DebounceSeconds int `toml:"debounce_seconds"`
