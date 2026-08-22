@@ -60,6 +60,11 @@ type Producer struct {
 	// TrustedPath pins the expected absolute path of the opencode binary.
 	// Empty disables the pin: any resolved path is allowed.
 	TrustedPath string `toml:"trusted_opencode_path"`
+	// StrictCheck turns device-local producer fingerprint drift into a
+	// refusal instead of a loud warning. Default (false) warns and proceeds,
+	// because the exact export↔installed version pin still guards write-back
+	// correctness.
+	StrictCheck bool `toml:"strict_producer_check"`
 }
 
 const (

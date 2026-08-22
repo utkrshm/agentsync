@@ -61,6 +61,14 @@ type Adapter struct {
 	// BinaryPath resolves the absolute path of the opencode executable that
 	// all exec sites use (default caches per process).
 	BinaryPath func() (string, error)
+	// Fingerprint returns the sha256 hex of the binary at BinaryPath, for
+	// device-local producer drift detection.
+	Fingerprint func() (string, error)
+	// ProducerStateFile is the path to the device-local producer fingerprint
+	// record (~/.config/agent-sync/opencode-producer.json).
+	ProducerStateFile func() (string, error)
+	// Loggerf emits user-facing warnings (drift notices). Default: stderr.
+	Loggerf func(format string, args ...any)
 	// VerifyImport confirms the imported session is associated with targetDir.
 	VerifyImport func(exportPath, targetDir string) error
 	// ShouldCapture applies deny policy after resolving session metadata but
@@ -74,6 +82,10 @@ type Adapter struct {
 	// Populated by callers from config.Producer.TrustedPath — the adapter
 	// package does not import internal/config.
 	TrustedPath string
+	// StrictCheck, when true, turns producer fingerprint drift into a
+	// refusal instead of a warning. Populated by callers from
+	// config.Producer.StrictCheck.
+	StrictCheck bool
 
 	acknowledged map[string]int64
 	stateLoaded  bool
@@ -88,17 +100,19 @@ type CaptureAcknowledger interface {
 // NewAdapter returns an Adapter wired to the real opencode CLI.
 func NewAdapter() *Adapter {
 	return &Adapter{
-		DataDir:      DataDir,
-		Export:       Export,
-		QueryRecent:  dbQuery,
-		Import:       Import,
-		ImportInto:   ImportInto,
-		PatchImport:  PatchImport,
-		ProcessGuard: IsToolRunning,
-		ToolVersion:  ToolVersion,
-		BinaryPath:   BinaryPath,
-		VerifyImport: VerifyImport,
-		StateFile:    stateFilePath,
+		DataDir:           DataDir,
+		Export:            Export,
+		QueryRecent:       dbQuery,
+		Import:            Import,
+		ImportInto:        ImportInto,
+		PatchImport:       PatchImport,
+		ProcessGuard:      IsToolRunning,
+		ToolVersion:       ToolVersion,
+		BinaryPath:        BinaryPath,
+		Fingerprint:       Fingerprint,
+		ProducerStateFile: defaultProducerStatePath,
+		VerifyImport:      VerifyImport,
+		StateFile:         stateFilePath,
 	}
 }
 

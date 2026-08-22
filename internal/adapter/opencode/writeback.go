@@ -34,7 +34,12 @@ func (a *Adapter) ValidateArtifact(s *session.Session) error {
 	if normalizeVersion(installed) != normalizeVersion(info.Version) {
 		return fmt.Errorf("OpenCode version mismatch: export is %s, installed is %s; refusing write-back", info.Version, installed)
 	}
-	return a.checkTrustedBinary()
+	// Provenance gates run only after the compatibility pin passed: a binary
+	// that cannot write back correctly anyway needs no drift analysis.
+	if err := a.checkTrustedBinary(); err != nil {
+		return err
+	}
+	return a.observeProducer(installed)
 }
 
 // checkTrustedBinary refuses write-back when the resolved opencode binary
@@ -87,6 +92,11 @@ func (a *Adapter) WriteBack(s *session.Session, targetLocalPath string) error {
 			return err
 		}
 	}
+	// The import succeeded, so the current binary becomes the new producer
+	// baseline (drift warnings stop on the next run). See
+	// persistNewFingerprint for why this lives here rather than in
+	// BroadcastWriteBack.
+	a.persistNewFingerprint()
 	return nil
 }
 

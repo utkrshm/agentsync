@@ -67,6 +67,7 @@ func cmdReceive(args []string) error {
 	}
 	ad := opencode.NewAdapter()
 	ad.TrustedPath = cfg.Producer.TrustedPath
+	ad.StrictCheck = cfg.Producer.StrictCheck
 	attempted := 0
 	blocked := 0
 	for _, ex := range exports {

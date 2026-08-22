@@ -31,6 +31,7 @@ func TestWriteBackImportsFromTargetAndVerifies(t *testing.T) {
 		VerifyImport: func(path, dir string) error { verified = path == export && dir == proj; return nil },
 		ProcessGuard: func(string) (bool, error) { return false, nil },
 	}
+	stubProducer(t, ad)
 	if err := ad.WriteBack(&session.Session{ID: "ses_import1", CanonicalKey: "github.com-user-x", PayloadPath: export}, proj); err != nil {
 		t.Fatalf("WriteBack: %v", err)
 	}
@@ -71,6 +72,7 @@ func TestBroadcastSkipsBusyCandidateAndKeepsFailure(t *testing.T) {
 		ToolVersion:  compatibleVersion,
 		ProcessGuard: func(cand string) (bool, error) { return strings.HasSuffix(cand, "busy"), nil },
 	}
+	stubProducer(t, ad)
 	s := &session.Session{ID: "ses_b1", CanonicalKey: "k", PayloadPath: export}
 	res := ad.BroadcastWriteBack(s, []string{"/tmp/idle", "/tmp/busy", "/tmp/fail"})
 	if len(res.Imported) != 1 || res.Imported[0] != "/tmp/idle" {
@@ -95,6 +97,7 @@ func TestBroadcastDegradedWhenMultipleImported(t *testing.T) {
 		ToolVersion:  compatibleVersion,
 		ProcessGuard: func(string) (bool, error) { return false, nil },
 	}
+	stubProducer(t, ad)
 	res := ad.BroadcastWriteBack(&session.Session{ID: "ses_b2", CanonicalKey: "k", PayloadPath: export}, []string{"/tmp/c1", "/tmp/c2"})
 	if len(res.Imported) != 2 || !res.Degraded {
 		t.Fatalf("expected degraded two-clone result, got %#v", res)

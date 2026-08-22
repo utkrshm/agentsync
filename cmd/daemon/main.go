@@ -100,6 +100,7 @@ func runOpenCodeWatcher(ctx context.Context, cfg config.Config, repo *syncrepo.R
 	// Provenance config is wired even though the daemon only captures: any
 	// future write-back path through this adapter must honor the same pin.
 	ad.TrustedPath = cfg.Producer.TrustedPath
+	ad.StrictCheck = cfg.Producer.StrictCheck
 	// OpenCode stores every project in one database. Evaluate deny policy from
 	// per-session metadata before export, not from the shared DB filename.
 	ad.ShouldCapture = func(localPath string, key session.CanonicalKey) bool {
