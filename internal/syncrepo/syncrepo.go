@@ -19,6 +19,13 @@ import (
 // must not push.
 var ErrNoChanges = errors.New("no changes to commit")
 
+// ErrForeignUntrackedConflict is returned by PullFastForward (and propagated
+// by Push/PullForced) when incoming history would overwrite an untracked file
+// outside the sync-owned allowlist. The user placed that file; deleting it as
+// a sync side effect is never acceptable. Callers can detect this with
+// errors.Is and surface the remediation message without extra wrapping.
+var ErrForeignUntrackedConflict = errors.New("untracked files outside the sync allowlist conflict with incoming history")
+
 const (
 	// gitignorePath is the exact repo-relative path of the tracked .gitignore.
 	gitignorePath = ".gitignore"
@@ -245,9 +252,14 @@ func (r *Repo) nextVersion() (int, error) {
 
 // Push pulls fast-forward first (trigger 1, SPEC-DOC.md §5.2) then pushes.
 // If the remote has diverged, the ff-merge fails and we return the error
-// rather than force-pushing (AGENTS.md invariant #9).
+// rather than force-pushing (AGENTS.md invariant #9). A foreign-untracked
+// conflict is propagated unwrapped: its message already states exactly what
+// happened and what to do, and claiming divergence would be misleading.
 func (r *Repo) Push() error {
 	if err := r.PullFastForward(); err != nil {
+		if errors.Is(err, ErrForeignUntrackedConflict) {
+			return err
+		}
 		return fmt.Errorf("pre-push fast-forward merge failed (remote likely diverged — refusing to force-push): %w", err)
 	}
 	if _, err := r.git("push", "origin", "HEAD"); err != nil {
@@ -289,12 +301,18 @@ func (r *Repo) PullFastForward() error {
 }
 
 // clearConflictingUntracked removes untracked working-tree files that the
-// incoming commit would overwrite. A fresh `agent-sync init` leaves a
-// generated, untracked .gitignore behind; when another device has committed
-// the same file, a fast-forward merge refuses to overwrite it even when the
-// content is identical. These are deterministic generated files (git merge has
-// no "overwrite untracked on ff-merge" flag), so removing exactly the
-// conflicting ones is safe — no unrelated local file is touched.
+// incoming commit would overwrite — but only files agent-sync owns (the
+// tracked .gitignore and paths under opencode/). A fresh `agent-sync init`
+// leaves a generated, untracked .gitignore behind; when another device has
+// committed the same file, a fast-forward merge refuses to overwrite it even
+// when the content is identical. These are deterministic generated files
+// (git merge has no "overwrite untracked on ff-merge" flag), so removing
+// exactly the conflicting, allowlisted ones is safe.
+//
+// A conflicting untracked file outside the allowlist was placed there by the
+// user: deleting it as a sync side effect is never acceptable. If any such
+// file exists, nothing foreign is touched and ErrForeignUntrackedConflict is
+// returned listing every affected path with remediation instructions.
 func (r *Repo) clearConflictingUntracked(tip string) error {
 	out, err := r.git("ls-files", "--others", "--exclude-standard")
 	if err != nil {
@@ -319,13 +337,23 @@ func (r *Repo) clearConflictingUntracked(tip string) error {
 			incoming[line] = true
 		}
 	}
+	var foreignConflicts []string
 	for _, f := range untracked {
 		if !incoming[f] {
+			continue
+		}
+		if !allowlisted(f) {
+			foreignConflicts = append(foreignConflicts, f)
 			continue
 		}
 		if err := os.Remove(filepath.Join(r.Path, f)); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+	}
+	if len(foreignConflicts) > 0 {
+		sort.Strings(foreignConflicts)
+		return fmt.Errorf("%w: refusing fast-forward: incoming history would overwrite untracked file(s) you placed here:\n  %s\nmove or remove them manually, then retry",
+			ErrForeignUntrackedConflict, strings.Join(foreignConflicts, "\n  "))
 	}
 	return nil
 }
@@ -371,8 +399,13 @@ func (r *Repo) remoteTip() (string, bool, error) {
 // an error to the caller — resuming against stale state is unsafe, so this
 // must not be silently deferred. It is a no-op when the remote is empty or
 // local is already up to date/ahead (same semantics as PullFastForward).
+// A foreign-untracked conflict propagates unwrapped: "stale state" would
+// misdescribe it and its own message carries the remediation.
 func (r *Repo) PullForced() error {
 	if err := r.PullFastForward(); err != nil {
+		if errors.Is(err, ErrForeignUntrackedConflict) {
+			return err
+		}
 		return fmt.Errorf("pre-write-back pull failed (refusing to write against stale state): %w", err)
 	}
 	return nil
