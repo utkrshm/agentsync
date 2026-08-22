@@ -9,7 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
+
+	"agentsync/internal/deviceid"
 )
 
 // ErrNoChanges is returned by Commit when the working tree had nothing new to
@@ -72,7 +73,13 @@ func (r *Repo) Init() error {
 		return err
 	}
 	// Ensure .sync-meta.json exists so it's read/written from the start.
-	if err := r.WriteMeta(SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID()}); err != nil {
+	// The device id comes from the durable per-device identity file
+	// (internal/deviceid) so it survives meta corruption across devices.
+	deviceID, err := deviceid.LoadOrCreate()
+	if err != nil {
+		return fmt.Errorf("load device id: %w", err)
+	}
+	if err := r.WriteMeta(SyncMeta{SchemaVersion: 1, DeviceID: deviceID}); err != nil {
 		return err
 	}
 	return nil
@@ -292,20 +299,21 @@ func (r *Repo) WriteMeta(m SyncMeta) error {
 	return os.WriteFile(filepath.Join(r.Path, ".sync-meta.json"), data, 0o600)
 }
 
-// TouchMeta updates the device's last-sync timestamp inside .sync-meta.json.
+// TouchMeta ensures .sync-meta.json exists with a stable device identity,
+// regenerating only what is missing (never an existing valid device id).
 func (r *Repo) TouchMeta() error {
 	m, err := r.ReadMeta()
 	if err != nil {
 		// Fresh repo / missing meta: seed with defaults.
-		m = SyncMeta{SchemaVersion: 1, DeviceID: newDeviceID()}
+		m = SyncMeta{SchemaVersion: 1}
 	}
 	m.SchemaVersion = 1
 	if m.DeviceID == "" {
-		m.DeviceID = newDeviceID()
+		deviceID, err := deviceid.LoadOrCreate()
+		if err != nil {
+			return fmt.Errorf("load device id: %w", err)
+		}
+		m.DeviceID = deviceID
 	}
 	return r.WriteMeta(m)
-}
-
-func newDeviceID() string {
-	return fmt.Sprintf("dev-%d", time.Now().UnixNano())
 }
