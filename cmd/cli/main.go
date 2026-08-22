@@ -9,14 +9,19 @@ import (
 
 const usage = `agent-sync — sync AI agent sessions across devices via git
 
-Usage:
-  agent-sync init [--repo <url>]              set up the sync repo (prompts for git URL)
-  agent-sync send <session-id>                export a session, commit (timestamped+versioned), push
-  agent-sync receive [--dry-run]              pull + write back pending sessions into local clones
-  agent-sync resume [--repo <code-repo>]      pull code + receive + pick a session to resume
-  agent-sync pull                             fetch + fast-forward the sync repo only
-  agent-sync index                            scan [repoindex] roots for local git repos
-  agent-sync help                             show this help
+Usage: agent-sync <command> [flags]
+
+Commands:
+  init      configure AgentSync and create the sync repo
+  send      export one OpenCode session into the sync repo and push
+  receive   pull the sync repo and write back pending sessions
+  resume    pull code repo, receive sessions, pick one to resume
+  pull      fetch + fast-forward the sync repo only
+  index     scan [repoindex] roots to find local clones for write-back
+  help      show help for all commands or one command
+
+Config lives at ~/.config/agent-sync/config.toml (see ` + "`agent-sync help init`" + `).
+Run "agent-sync help <command>" or "agent-sync <command> --help" for details.
 `
 
 func main() {
@@ -25,30 +30,69 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
-	cmd := args[0]
+	cmd, rest := args[0], args[1:]
+
+	switch cmd {
+	case "help", "-h", "--help":
+		if len(rest) == 0 || rest[0] == "help" {
+			fmt.Print(usage)
+			return
+		}
+		h, ok := commandHelp[rest[0]]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", rest[0], usage)
+			os.Exit(2)
+		}
+		fmt.Print(h)
+		return
+	}
+
+	if _, known := commandHelp[cmd]; !known {
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
+		os.Exit(2)
+	}
+	if hasHelpFlag(rest) {
+		fmt.Print(commandHelp[cmd])
+		return
+	}
+
 	var err error
 	switch cmd {
 	case "init":
-		err = cmdInit(args[1:])
+		err = cmdInit(rest)
 	case "send":
-		err = cmdSend(args[1:])
+		err = cmdSend(rest)
 	case "receive":
-		err = cmdReceive(args[1:])
+		err = cmdReceive(rest)
 	case "resume":
-		err = cmdResume(args[1:])
+		err = cmdResume(rest)
 	case "pull":
-		err = cmdPull(args[1:])
+		err = cmdPull(rest)
 	case "index":
-		err = cmdIndex(args[1:])
-	case "help", "-h", "--help":
-		fmt.Print(usage)
-		return
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
-		os.Exit(2)
+		err = cmdIndex(rest)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-sync %s: %v\n", cmd, err)
 		os.Exit(1)
 	}
+}
+
+// commandHelp maps every dispatchable command to its detailed usage text,
+// defined next to each command's implementation.
+var commandHelp = map[string]string{
+	"init":    initUsage,
+	"send":    sendUsage,
+	"receive": receiveUsage,
+	"resume":  resumeUsage,
+	"pull":    pullUsage,
+	"index":   indexUsage,
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+	return false
 }

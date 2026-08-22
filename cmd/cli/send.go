@@ -13,6 +13,22 @@ import (
 	"agentsync/internal/syncrepo"
 )
 
+const sendUsage = `agent-sync send — export an OpenCode session into the sync repo and push
+
+Usage:
+  agent-sync send <session-id>
+
+Runs "opencode export <session-id>", validates the result (complete JSON,
+matching session id, non-empty directory/version), stores it atomically at
+
+  opencode/<project-key>/export/<session-id>.json
+
+plus an import-meta sidecar, commits (timestamped + versioned), and pushes
+to origin. Only opencode/** and .gitignore are ever staged — anything else
+under the sync dir is skipped with a warning, never staged or deleted.
+Requires "agent-sync init" first.
+`
+
 // cmdSend exports an OpenCode session into the sync repo and pushes it.
 func cmdSend(args []string) error {
 	if len(args) < 1 {

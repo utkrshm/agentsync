@@ -6,15 +6,24 @@ import (
 	"time"
 )
 
+const indexUsage = `agent-sync index — refresh the local repo-index cache
+
+Usage:
+  agent-sync index
+
+Walks the directories configured under [repoindex] roots for local git
+repos so receive can resolve canonical project keys to clone paths
+without scanning at write-back time. Re-run after cloning a new
+project. The cache lives at ~/.cache/agent-sync/repo-index.db, outside
+the sync repo.
+`
+
 // cmdIndex runs a full repo-index scan over the configured roots, populating
 // the reverse-resolution cache used by write-back (SPEC-DOC.md §4.1). It can
 // be re-run any time (e.g. after cloning a new project).
 func cmdIndex(args []string) error {
 	for _, a := range args {
 		switch a {
-		case "--help", "-h":
-			fmt.Println("agent-sync index — scan [repoindex] roots for local git repos")
-			return nil
 		default:
 			return fmt.Errorf("unknown index flag %q", a)
 		}

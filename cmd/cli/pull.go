@@ -6,6 +6,17 @@ import (
 	"agentsync/internal/syncrepo"
 )
 
+const pullUsage = `agent-sync pull — fetch and fast-forward the sync repo only
+
+Usage:
+  agent-sync pull
+
+No write-back. Refuses diverged history (never force-pushes or
+auto-merges) and refuses to delete untracked files outside the sync
+allowlist (opencode/** and .gitignore); such conflicts fail with the
+offending paths listed for manual resolution.
+`
+
 // cmdPull fetches and fast-forwards the sync repo only (foundation for the
 // shell-init trigger, IMPLEMENTATION-PLAN.md §4.2).
 func cmdPull(args []string) error {

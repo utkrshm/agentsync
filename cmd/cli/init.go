@@ -10,6 +10,24 @@ import (
 	"agentsync/internal/syncrepo"
 )
 
+const initUsage = `agent-sync init — configure AgentSync and create the sync repo
+
+Usage:
+  agent-sync init [--repo <git-url>] [--device-alias <name>]
+
+Flags:
+  --repo <url>
+      Git remote storing synced sessions. Omitted: prompted for (blank
+      answer = local-only). If already configured, you confirm keeping it.
+  --device-alias <name>
+      Display-only label shown in conflict/recovery reports. Omitted:
+      prompted (blank keeps existing). Never part of device identity.
+
+Creates ~/.config/agent-sync/config.toml, initializes the sync repo
+(default ~/agent-sessions), records a durable per-device UUID in
+.sync-meta.json, and sets the origin remote.
+`
+
 // cmdInit sets up the sync repo: resolves the sync repo path, prompts for (or
 // accepts via --repo) the git URL, optionally records a display-only device
 // alias (--device-alias), initializes the repo, and adds the remote.

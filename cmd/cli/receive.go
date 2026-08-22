@@ -17,6 +17,29 @@ import (
 	"agentsync/internal/syncrepo"
 )
 
+const receiveUsage = `agent-sync receive — pull the sync repo and restore pending sessions locally
+
+Usage:
+  agent-sync receive [--dry-run]
+
+Fast-forward pulls the sync repo (diverged history is refused, never
+auto-merged or force-pushed), then writes back every new export into
+local clones of its project, resolved via the repo-index cache.
+
+Per-clone safety guards: UID-scoped check that opencode is not running
+(busy clones retry later with backoff), exact opencode version pinning,
+optional trusted-path/binary-drift checks ([producer] config), the
+project_id/directory patch after import, and verification against the
+live database.
+
+Outcomes are tracked per artifact digest + clone in
+~/.cache/agent-sync/receive-state.json. Busy and failed clones retry on
+later runs. When one session imports into multiple clones, the degraded
+one-to-one association outcome is reported explicitly.
+
+  --dry-run    print what would be written back; change nothing
+`
+
 // cmdReceive pulls the sync repo and writes back any new OpenCode sessions
 // into local clones of the matching project, applying the
 // project_id/directory patch. Write-back is broadcast across EVERY local
@@ -29,9 +52,6 @@ func cmdReceive(args []string) error {
 		switch arg {
 		case "--dry-run":
 			dryRun = true
-		case "--help", "-h":
-			fmt.Println("agent-sync receive [--dry-run] — pull and restore pending OpenCode sessions")
-			return nil
 		default:
 			return fmt.Errorf("unknown receive flag %q", arg)
 		}

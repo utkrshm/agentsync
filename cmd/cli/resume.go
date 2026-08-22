@@ -11,6 +11,18 @@ import (
 	"agentsync/internal/syncrepo"
 )
 
+const resumeUsage = `agent-sync resume — pull code, receive sessions, pick one to resume
+
+Usage:
+  agent-sync resume [--repo <code-repo-path>]
+
+1. Optionally runs "git pull" in --repo <path> (the code repo — a
+   separate git operation from the sync repo pull).
+2. Runs the full receive flow (see "agent-sync help receive").
+3. Shows a numbered picker over synced sessions and launches
+   "opencode -s <session-id>" for the chosen one.
+`
+
 // cmdResume composes the v0.1 one-shot flow:
 //  1. git -C <code-repo> pull   (code)
 //  2. receive logic             (session)
