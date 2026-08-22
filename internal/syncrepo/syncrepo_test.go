@@ -1,6 +1,8 @@
 package syncrepo
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,7 +77,7 @@ func TestPushFastForwardAndDivergence(t *testing.T) {
 	if err := repoA.Init(); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(deviceA, "f.txt"), []byte("a"), 0o600)
+	os.WriteFile(filepath.Join(deviceA, "opencode", "f.txt"), []byte("a"), 0o600)
 	if _, err := repoA.Commit("opencode", "sA", "2026-08-16T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
@@ -90,13 +92,13 @@ func TestPushFastForwardAndDivergence(t *testing.T) {
 	deviceB := filepath.Join(t.TempDir(), "devB")
 	git(t, t.TempDir(), "clone", "-q", bare, deviceB)
 	repoB := Open(deviceB)
-	os.WriteFile(filepath.Join(deviceB, "g.txt"), []byte("b"), 0o600)
+	writeFile(t, filepath.Join(deviceB, "opencode", "g.txt"), "b")
 	if _, err := repoB.Commit("opencode", "sB", "2026-08-16T00:02:00Z"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Device A pushes another commit, so remote advances.
-	os.WriteFile(filepath.Join(deviceA, "h.txt"), []byte("c"), 0o600)
+	writeFile(t, filepath.Join(deviceA, "opencode", "h.txt"), "c")
 	if _, err := repoA.Commit("opencode", "sA2", "2026-08-16T00:03:00Z"); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +123,7 @@ func TestPullFastForward(t *testing.T) {
 	if err := repoA.Init(); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(deviceA, "x.txt"), []byte("x"), 0o600)
+	writeFile(t, filepath.Join(deviceA, "opencode", "x.txt"), "x")
 	if _, err := repoA.Commit("opencode", "s", "2026-08-16T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +141,8 @@ func TestPullFastForward(t *testing.T) {
 	if err := repoB.PullFastForward(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(deviceB, "x.txt")); err != nil {
-		t.Errorf("pulled repo should contain x.txt: %v", err)
+	if _, err := os.Stat(filepath.Join(deviceB, "opencode", "x.txt")); err != nil {
+		t.Errorf("pulled repo should contain opencode/x.txt: %v", err)
 	}
 }
 
@@ -157,7 +159,7 @@ func TestPullFastForwardPushCreatedRemote(t *testing.T) {
 	if err := repoA.Init(); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(deviceA, "x.txt"), []byte("x"), 0o600)
+	writeFile(t, filepath.Join(deviceA, "opencode", "x.txt"), "x")
 	if _, err := repoA.Commit("opencode", "s", "2026-08-16T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
@@ -180,8 +182,8 @@ func TestPullFastForwardPushCreatedRemote(t *testing.T) {
 	if err := repoB.PullFastForward(); err != nil {
 		t.Fatalf("device B pull should succeed despite no origin/HEAD: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(deviceB, "x.txt")); err != nil {
-		t.Errorf("pulled repo should contain x.txt: %v", err)
+	if _, err := os.Stat(filepath.Join(deviceB, "opencode", "x.txt")); err != nil {
+		t.Errorf("pulled repo should contain opencode/x.txt: %v", err)
 	}
 }
 
@@ -225,5 +227,96 @@ func TestSyncMetaRoundTrip(t *testing.T) {
 	}
 	if m.SchemaVersion != 1 {
 		t.Errorf("expected schema version 1, got %d", m.SchemaVersion)
+	}
+}
+
+// captureWarnings swaps in an injectable Warnf that records every warning so
+// tests can assert on emitted output instead of stderr noise.
+func captureWarnings(r *Repo) func() string {
+	var buf strings.Builder
+	r.Warnf = func(format string, args ...any) {
+		fmt.Fprintf(&buf, format, args...)
+	}
+	return func() string { return buf.String() }
+}
+
+func TestCommitSkipsForeignPathsAndWarns(t *testing.T) {
+	dir := t.TempDir()
+	repo := Open(dir)
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "notes.txt"), "user placed this")
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "s1.json"), "{}")
+
+	warnings := captureWarnings(repo)
+
+	version, err := repo.Commit("opencode", "s1", "2026-08-16T00:00:00Z")
+	if err != nil {
+		t.Fatalf("commit with foreign files present should still succeed: %v", err)
+	}
+	if version != 1 {
+		t.Errorf("first commit should be v1, got v%d", version)
+	}
+
+	changed := git(t, dir, "show", "--name-only", "--format=", "HEAD")
+	if strings.Contains(changed, "notes.txt") {
+		t.Errorf("foreign file must not be committed, but HEAD contains it:\n%s", changed)
+	}
+	if !strings.Contains(changed, filepath.Join("opencode", "k", "export", "s1.json")) {
+		t.Errorf("sync-owned session file should be committed, got:\n%s", changed)
+	}
+	if !strings.Contains(warnings(), "skipping non-sync path: notes.txt") {
+		t.Errorf("expected a warning naming the foreign path, got:\n%s", warnings())
+	}
+
+	// The foreign file must remain untouched on disk and untracked.
+	data, err := os.ReadFile(filepath.Join(dir, "notes.txt"))
+	if err != nil || string(data) != "user placed this" {
+		t.Errorf("foreign file content changed on disk: %q, %v", data, err)
+	}
+	staged := git(t, dir, "status", "--porcelain")
+	if !strings.Contains(staged, "notes.txt") {
+		t.Errorf("foreign file should stay untracked, status:\n%s", staged)
+	}
+}
+
+func TestCommitNoForeignPathsNoWarnings(t *testing.T) {
+	dir := t.TempDir()
+	repo := Open(dir)
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "s1.json"), "{}")
+
+	warnings := captureWarnings(repo)
+
+	if _, err := repo.Commit("opencode", "s1", "2026-08-16T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if got := warnings(); got != "" {
+		t.Errorf("expected zero warnings without foreign paths, got:\n%s", got)
+	}
+}
+
+func TestCommitForeignOnlyChangeStillErrNoChanges(t *testing.T) {
+	dir := t.TempDir()
+	repo := Open(dir)
+	if err := repo.Init(); err != nil {
+		t.Fatal(err)
+	}
+	warnings := captureWarnings(repo)
+	writeFile(t, filepath.Join(dir, "opencode", "k", "export", "s1.json"), "{}")
+	if _, err := repo.Commit("opencode", "s1", "2026-08-16T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	// Only a foreign file changes afterwards → nothing sync-owned to stage,
+	// so Commit must still be a no-op (ErrNoChanges), not a hard error.
+	writeFile(t, filepath.Join(dir, "notes.txt"), "more user content")
+	if _, err := repo.Commit("opencode", "s1", "2026-08-16T00:01:00Z"); !errors.Is(err, ErrNoChanges) {
+		t.Errorf("expected ErrNoChanges when only foreign files changed, got %v", err)
+	}
+	if !strings.Contains(warnings(), "notes.txt") {
+		t.Errorf("expected a warning for the foreign-only change, got:\n%s", warnings())
 	}
 }

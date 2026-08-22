@@ -19,6 +19,20 @@ import (
 // must not push.
 var ErrNoChanges = errors.New("no changes to commit")
 
+const (
+	// gitignorePath is the exact repo-relative path of the tracked .gitignore.
+	gitignorePath = ".gitignore"
+	// payloadPrefix is the repo-relative directory under which all mirrored
+	// session payloads live. Everything under it is sync-owned.
+	payloadPrefix = "opencode/"
+)
+
+// allowlisted reports whether rel (slash-separated, repo-relative) is a path
+// agent-sync owns: the tracked .gitignore plus everything under opencode/.
+func allowlisted(rel string) bool {
+	return rel == gitignorePath || strings.HasPrefix(rel, payloadPrefix)
+}
+
 // SyncMeta is the per-device metadata stored in the sync repo's working tree
 // (.sync-meta.json). v0.1 keeps it minimal: schema version, device id, and
 // the set of session IDs this device has already imported (so `receive` only
@@ -32,10 +46,32 @@ type SyncMeta struct {
 // always shell out to the system git binary (AGENTS.md tech stack).
 type Repo struct {
 	Path string
+
+	// Warnf reports recoverable, user-visible issues (e.g. foreign files that
+	// Commit deliberately skips). Injectable like every other shell-out point;
+	// nil falls back to writing to os.Stderr.
+	Warnf func(format string, args ...any)
 }
 
 // Open returns a Repo for the given working-tree path.
-func Open(path string) *Repo { return &Repo{Path: path} }
+func Open(path string) *Repo {
+	return &Repo{Path: path, Warnf: defaultWarnf}
+}
+
+// defaultWarnf is the fallback Warnf: unadorned lines on stderr.
+func defaultWarnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
+// warn emits a warning through Warnf when set, stderr otherwise (covers Repos
+// constructed as struct literals rather than via Open).
+func (r *Repo) warn(format string, args ...any) {
+	if r.Warnf != nil {
+		r.Warnf(format, args...)
+		return
+	}
+	defaultWarnf(format, args...)
+}
 
 // Exists reports whether the working tree is an initialized git repo.
 func (r *Repo) Exists() bool {
@@ -102,16 +138,22 @@ func (r *Repo) HasRemote() bool {
 	return err == nil
 }
 
-// Commit stages all changes and creates a timestamped, versioned commit.
-// version is a monotonically increasing integer; the message format is:
+// Commit stages only sync-owned paths (the tracked .gitignore and everything
+// under opencode/) and creates a timestamped, versioned commit. version is a
+// monotonically increasing integer; the message format is:
 //
 //	sync: <tool> <session-id> v<version> <ISO-timestamp>
 //
-// If the working tree has nothing new to stage, it returns ErrNoChanges.
+// Anything else a user dropped into the working tree is never staged — it
+// would otherwise be committed and pushed forever as a sync side effect.
+// Each foreign modified/untracked path is surfaced as a warning instead, and
+// the commit proceeds with whatever was staged. If the working tree has
+// nothing new to stage, it returns ErrNoChanges.
 func (r *Repo) Commit(tool, sessionID, ts string) (version int, err error) {
-	if _, err := r.git("add", "-A"); err != nil {
+	if err := r.stageSyncOwned(); err != nil {
 		return 0, err
 	}
+	r.warnForeignPaths()
 	version, err = r.nextVersion()
 	if err != nil {
 		return 0, err
@@ -119,12 +161,72 @@ func (r *Repo) Commit(tool, sessionID, ts string) (version int, err error) {
 	msg := fmt.Sprintf("sync: %s %s v%d %s", tool, sessionID, version, ts)
 	out, err := r.git("commit", "-m", msg)
 	if err != nil {
-		if strings.Contains(strings.ToLower(out), "nothing to commit") {
+		// "nothing to commit": staged tree identical to HEAD.
+		// "nothing added to commit but untracked files present": only
+		// foreign paths changed and nothing sync-owned was staged. Both are
+		// no-ops for a sync repo, not failures.
+		low := strings.ToLower(out)
+		if strings.Contains(low, "nothing to commit") || strings.Contains(low, "nothing added to commit") {
 			return version, ErrNoChanges
 		}
 		return version, err
 	}
 	return version, nil
+}
+
+// stageSyncOwned runs `git add -A -- opencode .gitignore`. Git errors when a
+// pathspec matches nothing (e.g. before Init has written .gitignore or any
+// payload exists), so on failure fall back to adding each allowlisted path
+// that actually exists.
+func (r *Repo) stageSyncOwned() error {
+	if _, err := r.git("add", "-A", "--", strings.TrimSuffix(payloadPrefix, "/"), gitignorePath); err == nil {
+		return nil
+	}
+	for _, p := range []string{strings.TrimSuffix(payloadPrefix, "/"), gitignorePath} {
+		if _, err := os.Stat(filepath.Join(r.Path, p)); err != nil {
+			continue
+		}
+		if _, err := r.git("add", "-A", "--", p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// warnForeignPaths surfaces modified/untracked working-tree paths outside the
+// sync-owned allowlist without failing the commit. Ignored files (e.g.
+// .sync-meta.json) never appear in porcelain output.
+func (r *Repo) warnForeignPaths() {
+	out, err := r.git("status", "--porcelain")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		rel := porcelainPath(line)
+		if rel == "" || allowlisted(rel) {
+			continue
+		}
+		r.warn("skipping non-sync path: %s\n", rel)
+	}
+}
+
+// porcelainPath extracts the repo-relative path from a `git status
+// --porcelain` entry, handling the rename form "R  old -> new" by returning
+// the new path (the one that would be staged).
+func porcelainPath(line string) string {
+	// Format: XY <path>; XY is two status bytes followed by one space.
+	body := line
+	if len(body) > 3 && body[2] == ' ' {
+		body = body[3:]
+	}
+	if i := strings.Index(body, " -> "); i >= 0 {
+		return body[i+4:]
+	}
+	return body
 }
 
 // nextVersion derives the commit version from the existing commit count.
