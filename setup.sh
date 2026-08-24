@@ -108,6 +108,11 @@ if [ "${1:-}" = "--run-help" ]; then
   agent-sync send <session-id>                                 # capture one session now
   agent-sync receive                                           # pull + restore pending sessions
   agent-sync resume [--repo <code-repo>]                       # one-shot resume flow
+  agent-sync pull                                              # fetch + fast-forward sync repo only
+  agent-sync migrate-layout [--dry-run]                        # move legacy exports to revisions layout
+  agent-sync revisions list [--project K] [--session ID]       # inspect stored revisions
+  agent-sync conflicts [--json]                                # report same-session conflicts
+  agent-sync recover <session-id> [--revision <prefix>]        # restore one revision of a conflict
   agent-sync-daemon                                            # real-time watcher (foreground)
 EOF
 fi
