@@ -33,11 +33,21 @@ func TestResolveAlias(t *testing.T) {
 				return answer, nil
 			}
 	}
+	// run swallows resolveAlias's interactive prompt output (e.g. "Device
+	// alias already configured: …") so unit tests never print to the real
+	// terminal; the assertions below cover values and call counts.
+	run := func(t *testing.T, flagVal, stored string, askKeep func() (bool, error), askInput func(string) (string, error)) (string, error) {
+		t.Helper()
+		var got string
+		var err error
+		captureStdout(t, func() { got, err = resolveAlias(flagVal, stored, askKeep, askInput) })
+		return got, err
+	}
 
 	t.Run("flag overrides stored alias without prompting", func(t *testing.T) {
 		keepCalls, inputCalls := 0, 0
 		askKeep, askInput := newAsk(true, "", &keepCalls, &inputCalls)
-		got, err := resolveAlias("desktop", "laptop", askKeep, askInput)
+		got, err := run(t, "desktop", "laptop", askKeep, askInput)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -52,7 +62,7 @@ func TestResolveAlias(t *testing.T) {
 	t.Run("stored alias kept on confirmation", func(t *testing.T) {
 		keepCalls, inputCalls := 0, 0
 		askKeep, askInput := newAsk(true, "", &keepCalls, &inputCalls)
-		got, err := resolveAlias("", "laptop", askKeep, askInput)
+		got, err := run(t, "", "laptop", askKeep, askInput)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,7 +77,7 @@ func TestResolveAlias(t *testing.T) {
 	t.Run("refusing stored alias falls through to prompt", func(t *testing.T) {
 		keepCalls, inputCalls := 0, 0
 		askKeep, askInput := newAsk(false, "workstation", &keepCalls, &inputCalls)
-		got, err := resolveAlias("", "laptop", askKeep, askInput)
+		got, err := run(t, "", "laptop", askKeep, askInput)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +92,7 @@ func TestResolveAlias(t *testing.T) {
 	t.Run("blank input keeps stored alias", func(t *testing.T) {
 		keepCalls, inputCalls := 0, 0
 		askKeep, askInput := newAsk(false, "", &keepCalls, &inputCalls)
-		got, err := resolveAlias("", "laptop", askKeep, askInput)
+		got, err := run(t, "", "laptop", askKeep, askInput)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,7 +104,7 @@ func TestResolveAlias(t *testing.T) {
 	t.Run("no stored alias with blank input stays empty", func(t *testing.T) {
 		keepCalls, inputCalls := 0, 0
 		askKeep, askInput := newAsk(false, "", &keepCalls, &inputCalls)
-		got, err := resolveAlias("", "", askKeep, askInput)
+		got, err := run(t, "", "", askKeep, askInput)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,7 +118,7 @@ func TestResolveAlias(t *testing.T) {
 
 	t.Run("confirmation error propagates", func(t *testing.T) {
 		sentinel := errors.New("stdin closed")
-		got, err := resolveAlias("", "laptop",
+		got, err := run(t, "", "laptop",
 			func() (bool, error) { return false, sentinel },
 			func(string) (string, error) { return "", nil })
 		if !errors.Is(err, sentinel) {

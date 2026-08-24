@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"agentsync/internal/revision"
 	"agentsync/internal/session"
 )
 
@@ -57,7 +58,8 @@ func TestAdapterOnChangeAndMirror(t *testing.T) {
 			}
 			return json.Marshal(rows)
 		},
-		StateFile: func() (string, error) { return filepath.Join(cfgDir, "opencode-watch.json"), nil },
+		StateFile:    func() (string, error) { return filepath.Join(cfgDir, "opencode-watch.json"), nil },
+		SourceDevice: func() (string, error) { return "dev-fixture", nil },
 	}
 
 	// First sweep: both sessions are new.
@@ -85,13 +87,27 @@ func TestAdapterOnChangeAndMirror(t *testing.T) {
 		if !strings.HasPrefix(s.PayloadPath, repoRoot) {
 			t.Errorf("payload path should be under repo root, got %q", s.PayloadPath)
 		}
-		// Export and import-meta files must exist.
+		raw, err := os.ReadFile(s.PayloadPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := revision.DigestBytes(raw)
+		// Revision payload and sidecar files must exist at the digest path,
+		// and nothing may remain of the legacy flat layout.
 		for _, rel := range []string{
+			revision.Path(string(s.CanonicalKey), s.ID, digest),
+			revision.MetaPath(string(s.CanonicalKey), s.ID, digest),
+		} {
+			if _, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(rel))); err != nil {
+				t.Errorf("expected %s to exist: %v", rel, err)
+			}
+		}
+		for _, legacy := range []string{
 			filepath.Join("opencode", string(s.CanonicalKey), "export", s.ID+".json"),
 			filepath.Join("opencode", string(s.CanonicalKey), "import-meta", s.ID+".json"),
 		} {
-			if _, err := os.Stat(filepath.Join(repoRoot, rel)); err != nil {
-				t.Errorf("expected %s to exist: %v", rel, err)
+			if _, err := os.Stat(filepath.Join(repoRoot, legacy)); !os.IsNotExist(err) {
+				t.Errorf("legacy layout must not be written anymore: %s (stat err=%v)", legacy, err)
 			}
 		}
 	}
@@ -176,6 +192,9 @@ func TestWatchStateRoundTrip(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "opencode-watch.json")
 	ad := NewAdapter()
 	ad.StateFile = func() (string, error) { return p, nil }
+	// Keep the device-id resolution hermetic: the default wiring points at
+	// the real per-user config dir.
+	ad.SourceDevice = func() (string, error) { return "dev-fixture", nil }
 
 	// Create the payload temp file Mirror will copy.
 	tmp := filepath.Join(t.TempDir(), "payload.json")
@@ -223,7 +242,8 @@ func TestMirrorWithoutCommitAcknowledgementIsRetried(t *testing.T) {
 		PayloadPath:  payload,
 	}
 	ad := &Adapter{
-		StateFile: func() (string, error) { return state, nil },
+		StateFile:    func() (string, error) { return state, nil },
+		SourceDevice: func() (string, error) { return "dev-fixture", nil },
 	}
 	if err := ad.Mirror(&s, repo); err != nil {
 		t.Fatal(err)
@@ -233,8 +253,9 @@ func TestMirrorWithoutCommitAcknowledgementIsRetried(t *testing.T) {
 		QueryRecent: func(string) ([]byte, error) {
 			return json.Marshal([]changedSession{{ID: s.ID, TimeUpdated: 42, Directory: project}})
 		},
-		Export:    func(id, out string) error { return fixtureExport(out, id, project) },
-		StateFile: func() (string, error) { return state, nil },
+		Export:       func(id, out string) error { return fixtureExport(out, id, project) },
+		StateFile:    func() (string, error) { return state, nil },
+		SourceDevice: func() (string, error) { return "dev-fixture", nil },
 	}
 	got, err := ad2.OnChange(session.WatchEvent{})
 	if err != nil {

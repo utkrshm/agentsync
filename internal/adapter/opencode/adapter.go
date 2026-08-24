@@ -22,9 +22,10 @@ import (
 	"strings"
 	"time"
 
-	"agentsync/internal/artifact"
 	"agentsync/internal/canonicalkey"
+	"agentsync/internal/deviceid"
 	"agentsync/internal/fsutil"
+	"agentsync/internal/revision"
 	"agentsync/internal/session"
 )
 
@@ -78,10 +79,14 @@ type Adapter struct {
 	ShouldCapture func(localPath string, key session.CanonicalKey) bool
 	// StateFile is the path to the per-session capture state file.
 	StateFile func() (string, error)
-	// Store persists mirrored artifacts into the sync repo atomically.
-	// Zero value is the plain disk store; injectable so a future layer can
-	// wrap the write path without touching Mirror.
-	Store artifact.Store
+	// SourceDevice resolves this device's durable identity for revision
+	// sidecar metadata. Injectable so fixture tests stay hermetic; default
+	// wired in NewAdapter to deviceid.LoadOrCreate.
+	SourceDevice func() (string, error)
+	// DeviceAlias returns the optional display-only label recorded in
+	// revision sidecars. Default is a constant "" — CLI commands override it
+	// from config.
+	DeviceAlias func() string
 
 	// TrustedPath, when non-empty, pins the allowed absolute opencode binary
 	// path; ValidateArtifact refuses write-back when resolution differs.
@@ -119,6 +124,8 @@ func NewAdapter() *Adapter {
 		ProducerStateFile: defaultProducerStatePath,
 		VerifyImport:      VerifyImport,
 		StateFile:         stateFilePath,
+		SourceDevice:      deviceid.LoadOrCreate,
+		DeviceAlias:       func() string { return "" },
 	}
 }
 
@@ -220,12 +227,20 @@ func (a *Adapter) exportOne(c changedSession, key session.CanonicalKey) (*sessio
 	}, nil
 }
 
-// Mirror implements session.Adapter: validate the export payload, copy it
-// into the sync repo layout atomically, and write the receive-side
-// import-meta. The payload is read once and validated before anything is
-// written — a truncated or mismatched export leaves no file under the
-// destination path. Capture acknowledgement is a separate operation because
-// the daemon must not advance its cursor until the sync-repo commit succeeds.
+// Mirror implements session.Adapter: validate the export payload, then store
+// it as an immutable revision artifact (docs/hardening-plan.md WS-B) —
+//
+//	opencode/<key>/sessions/<session-id>/revisions/<digest>.json        payload
+//	opencode/<key>/sessions/<session-id>/revisions/<digest>.meta.json   sidecar
+//
+// The payload is read once and validated before anything is written — a
+// truncated or mismatched export leaves no file under the destination path.
+// Identical re-mirrors are payload no-ops; the digest-named path makes
+// overwriting a different revision structurally impossible. The sidecar
+// records source device, capture time, and the parsed export info so receive
+// can apply the project_id/directory patch without a legacy import-meta file.
+// Capture acknowledgement is a separate operation because the daemon must not
+// advance its cursor until the sync-repo commit succeeds.
 func (a *Adapter) Mirror(s *session.Session, repoRoot string) error {
 	if err := a.loadState(); err != nil {
 		return err
@@ -238,19 +253,40 @@ func (a *Adapter) Mirror(s *session.Session, repoRoot string) error {
 	if err != nil {
 		return err
 	}
-	dest := filepath.Join(repoRoot, "opencode", string(s.CanonicalKey), "export", s.ID+".json")
-	if _, err := a.Store.Write(dest, payload); err != nil {
+	if a.SourceDevice == nil {
+		return fmt.Errorf("mirror %s: source device resolution is not configured", s.ID)
+	}
+	deviceID, err := a.SourceDevice()
+	if err != nil {
+		return fmt.Errorf("resolve source device id for revision sidecar: %w", err)
+	}
+	captured := s.LastModified
+	if captured.IsZero() {
+		captured = time.Now()
+	}
+	alias := ""
+	if a.DeviceAlias != nil {
+		alias = a.DeviceAlias()
+	}
+	key := string(s.CanonicalKey)
+	meta := revision.Meta{
+		SchemaVersion:     revision.SchemaVersion,
+		OriginalSessionID: s.ID,
+		Digest:            revision.DigestBytes(payload),
+		SourceDeviceID:    deviceID,
+		DeviceAlias:       alias,
+		CapturedAt:        captured.UTC(),
+		ProducerVersion:   info.Version,
+		Status:            revision.StatusCaptured,
+		ProjectID:         info.ProjectID,
+		Directory:         info.Directory,
+		Title:             info.Title,
+	}
+	if _, err := revision.Write(repoRoot, key, s.ID, payload, meta); err != nil {
 		return err
 	}
-	s.PayloadPath = dest
-
-	// Write import-meta so `receive` can apply the project_id/directory patch,
-	// built from the same parsed info as the stored export.
-	metaPath := filepath.Join(repoRoot, "opencode", string(s.CanonicalKey), "import-meta", s.ID+".json")
-	if err := WriteImportMeta(metaPath, info); err != nil {
-		return err
-	}
-
+	s.PayloadPath = filepath.Join(repoRoot,
+		filepath.FromSlash(revision.Path(key, s.ID, meta.Digest)))
 	return nil
 }
 

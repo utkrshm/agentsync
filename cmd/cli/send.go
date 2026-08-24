@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"agentsync/internal/adapter/opencode"
-	"agentsync/internal/artifact"
 	"agentsync/internal/canonicalkey"
+	"agentsync/internal/deviceid"
+	"agentsync/internal/revision"
 	"agentsync/internal/syncrepo"
 )
 
@@ -19,13 +19,17 @@ Usage:
   agent-sync send <session-id>
 
 Runs "opencode export <session-id>", validates the result (complete JSON,
-matching session id, non-empty directory/version), stores it atomically at
+matching session id, non-empty directory/version), then stores it as an
+immutable revision artifact:
 
-  opencode/<project-key>/export/<session-id>.json
+  opencode/<project-key>/sessions/<session-id>/revisions/<digest>.json
+  opencode/<project-key>/sessions/<session-id>/revisions/<digest>.meta.json
 
-plus an import-meta sidecar, commits (timestamped + versioned), and pushes
-to origin. Only opencode/** and .gitignore are ever staged — anything else
-under the sync dir is skipped with a warning, never staged or deleted.
+where <digest> is the sha256 of the exact export bytes. Re-sending identical
+content is a no-op; distinct revisions of the same session are preserved side
+by side. Commits (timestamped + versioned) and pushes to origin. Only
+opencode/** and .gitignore are ever staged — anything else under the sync dir
+is skipped with a warning, never staged or deleted.
 Requires "agent-sync init" first.
 `
 
@@ -44,6 +48,12 @@ func cmdSend(args []string) error {
 	repo.ValidateArtifact = opencode.CheckArtifactFile
 	if !repo.Exists() {
 		return fmt.Errorf("sync repo not initialized at %s — run `agent-sync init`", cfg.Sync.RepoPath)
+	}
+	// Fresh-join migration (docs/hardening-plan.md WS-B): a repo holding only
+	// legacy exports is migrated silently before this send appends its own
+	// revision; a mixed repo just gets a hint. Runs at most once per process.
+	if err := migrateIfNeededOnce(repo); err != nil {
+		return err
 	}
 
 	// Export to a temp file first so a killed export never lands in the repo.
@@ -71,18 +81,28 @@ func cmdSend(args []string) error {
 	// Resolve canonical key from the session's source project directory.
 	key := canonicalkey.Resolve(info.Directory)
 
-	// Layout: <sync-repo>/opencode/<key>/export/<id>.json — written atomically,
-	// so no partial file is ever observable at the final path.
-	var store artifact.Store
-	rel := filepath.Join("opencode", string(key), "export", sessionID+".json")
-	dest := filepath.Join(repo.Path, rel)
-	if _, err := store.Write(dest, payload); err != nil {
-		return err
+	deviceID, err := deviceid.LoadOrCreate()
+	if err != nil {
+		return fmt.Errorf("load device id: %w", err)
 	}
 
-	// Write import-meta for the receive-side patch.
-	metaPath := filepath.Join(repo.Path, "opencode", string(key), "import-meta", sessionID+".json")
-	if err := opencode.WriteImportMeta(metaPath, info); err != nil {
+	// Immutable revisions layout: <sync-repo>/opencode/<key>/sessions/<id>/
+	// revisions/<digest>.json plus the .meta.json sidecar. Identical content
+	// is an idempotent no-op; different revisions of one session coexist.
+	meta := revision.Meta{
+		SchemaVersion:     revision.SchemaVersion,
+		OriginalSessionID: sessionID,
+		Digest:            revision.DigestBytes(payload),
+		SourceDeviceID:    deviceID,
+		DeviceAlias:       cfg.Sync.DeviceAlias,
+		CapturedAt:        time.Now().UTC(),
+		ProducerVersion:   info.Version,
+		Status:            revision.StatusCaptured,
+		ProjectID:         info.ProjectID,
+		Directory:         info.Directory,
+		Title:             info.Title,
+	}
+	if _, err := revision.Write(repo.Path, string(key), sessionID, payload, meta); err != nil {
 		return err
 	}
 

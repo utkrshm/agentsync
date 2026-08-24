@@ -6,7 +6,8 @@ import (
 )
 
 func TestCommandHelpCoversEveryDispatchedCommand(t *testing.T) {
-	dispatched := []string{"init", "send", "receive", "resume", "pull", "index"}
+	dispatched := []string{"init", "send", "receive", "resume", "pull", "index",
+		"migrate-layout", "recover", "revisions", "conflicts"}
 	for _, cmd := range dispatched {
 		h, ok := commandHelp[cmd]
 		if !ok {
@@ -47,7 +48,8 @@ func TestHasHelpFlag(t *testing.T) {
 }
 
 func TestTopLevelUsageListsAllCommands(t *testing.T) {
-	for _, cmd := range []string{"init", "send", "receive", "resume", "pull", "index", "help"} {
+	for _, cmd := range []string{"init", "send", "receive", "resume", "pull", "index",
+		"migrate-layout", "recover", "revisions", "conflicts", "help"} {
 		if !strings.Contains(usage, cmd) {
 			t.Errorf("usage text missing command %q", cmd)
 		}

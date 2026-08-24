@@ -12,13 +12,17 @@ const usage = `agent-sync — sync AI agent sessions across devices via git
 Usage: agent-sync <command> [flags]
 
 Commands:
-  init      configure AgentSync and create the sync repo
-  send      export one OpenCode session into the sync repo and push
-  receive   pull the sync repo and write back pending sessions
-  resume    pull code repo, receive sessions, pick one to resume
-  pull      fetch + fast-forward the sync repo only
-  index     scan [repoindex] roots to find local clones for write-back
-  help      show help for all commands or one command
+  init           configure AgentSync and create the sync repo
+  send           export one OpenCode session into the sync repo and push
+  receive        pull the sync repo and write back pending sessions
+  resume         pull code repo, receive sessions, pick one to resume
+  pull           fetch + fast-forward the sync repo only
+  index          scan [repoindex] roots to find local clones for write-back
+  migrate-layout move legacy exports into the immutable revisions layout
+  recover        restore one chosen revision of a conflicted session
+  revisions      inspect stored session revisions (list)
+  conflicts      report same-session conflict groups
+  help           show help for all commands or one command
 
 Config lives at ~/.config/agent-sync/config.toml (see ` + "`agent-sync help init`" + `).
 Run "agent-sync help <command>" or "agent-sync <command> --help" for details.
@@ -70,6 +74,14 @@ func main() {
 		err = cmdPull(rest)
 	case "index":
 		err = cmdIndex(rest)
+	case "migrate-layout":
+		err = cmdMigrateLayout(rest)
+	case "recover":
+		err = cmdRecover(rest)
+	case "revisions":
+		err = cmdRevisions(rest)
+	case "conflicts":
+		err = cmdConflicts(rest)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-sync %s: %v\n", cmd, err)
@@ -80,12 +92,16 @@ func main() {
 // commandHelp maps every dispatchable command to its detailed usage text,
 // defined next to each command's implementation.
 var commandHelp = map[string]string{
-	"init":    initUsage,
-	"send":    sendUsage,
-	"receive": receiveUsage,
-	"resume":  resumeUsage,
-	"pull":    pullUsage,
-	"index":   indexUsage,
+	"init":           initUsage,
+	"send":           sendUsage,
+	"receive":        receiveUsage,
+	"resume":         resumeUsage,
+	"pull":           pullUsage,
+	"index":          indexUsage,
+	"migrate-layout": migrateUsage,
+	"recover":        recoverUsage,
+	"revisions":      revisionsUsage,
+	"conflicts":      conflictsUsage,
 }
 
 func hasHelpFlag(args []string) bool {

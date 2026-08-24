@@ -21,7 +21,30 @@ const (
 	StatusBusy     = "busy"
 	StatusFailed   = "failed"
 	StatusDegraded = "degraded"
+
+	// Terminal same-session conflict-handling outcomes
+	// (docs/session-conflict-handling-plan.md §4). Like verified/degraded,
+	// they close an outcome's retry lifecycle: a preserved/conflicted/
+	// duplicated/archive-only artifact is never scheduled for another
+	// attempt — restoring it requires the explicit recover flow, not a retry.
+	StatusPreserved   = "preserved"
+	StatusConflicted  = "conflicted"
+	StatusDuplicated  = "duplicated"
+	StatusArchiveOnly = "archive-only"
 )
+
+// Terminal reports whether status closes an outcome's retry lifecycle.
+// Only busy/failed schedule retries; every other known status (successful,
+// degraded, or conflict-preserved outcomes) is terminal and must carry no
+// backoff state.
+func Terminal(status string) bool {
+	switch status {
+	case StatusVerified, StatusDegraded,
+		StatusPreserved, StatusConflicted, StatusDuplicated, StatusArchiveOnly:
+		return true
+	}
+	return false
+}
 
 // Outcome describes this device's most recent attempt to restore one artifact
 // into one local clone.
@@ -101,6 +124,9 @@ func (s *Store) Put(outcome Outcome) error {
 			outcome.NextAttempt = outcome.LastAttempt.Add(retry.Backoff(outcome.Attempts))
 		}
 	} else {
+		// Terminal outcomes (see Terminal) — and any unknown status, treated
+		// conservatively the same way — never carry retry scheduling:
+		// NextAttempt is zeroed and Attempts are left exactly as provided.
 		outcome.NextAttempt = time.Time{}
 	}
 	st.Outcomes[key] = outcome

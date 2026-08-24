@@ -1,13 +1,8 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 
 	"agentsync/internal/adapter/opencode"
@@ -26,6 +21,11 @@ Fast-forward pulls the sync repo (diverged history is refused, never
 auto-merged or force-pushed), then writes back every new export into
 local clones of its project, resolved via the repo-index cache.
 
+Same-session conflicts are detected BEFORE any write-back: a session with
+multiple distinct preserved revisions is reported explicitly and nothing is
+restored — every revision stays archive-only until you choose one with
+"agent-sync recover <session-id>".
+
 Per-clone safety guards: UID-scoped check that opencode is not running
 (busy clones retry later with backoff), exact opencode version pinning,
 optional trusted-path/binary-drift checks ([producer] config), the
@@ -34,18 +34,27 @@ live database.
 
 Outcomes are tracked per artifact digest + clone in
 ~/.cache/agent-sync/receive-state.json. Busy and failed clones retry on
-later runs. When one session imports into multiple clones, the degraded
-one-to-one association outcome is reported explicitly.
+later runs; conflicted sessions are marked archive-only per revision and
+never retried automatically. When one session imports into multiple
+clones, the degraded one-to-one association outcome is reported explicitly.
 
-  --dry-run    print what would be written back; change nothing
+  --dry-run    print what would be written back (including would-be
+               archive-only conflict verdicts); change nothing
 `
 
 // cmdReceive pulls the sync repo and writes back any new OpenCode sessions
 // into local clones of the matching project, applying the
-// project_id/directory patch. Write-back is broadcast across EVERY local
-// clone resolved for a session's canonical key (SPEC-DOC.md §4.1); a clone
-// where opencode is currently running is skipped and retried on the next pull
-// (AGENTS.md invariant #2).
+// project_id/directory patch.
+//
+// Sessions are processed as CONFLICT GROUPS, not raw refs: revisions are
+// grouped by canonical key + original session id first, and detection runs
+// BEFORE any write-back (docs/session-conflict-handling-plan.md §3). A
+// conflicted group is never restored — every revision is recorded
+// archive-only per digest×clone and an explicit report names each one.
+// Write-back for clean groups is broadcast across EVERY local clone resolved
+// for a session's canonical key (SPEC-DOC.md §4.1); a clone where opencode is
+// currently running is skipped and retried on the next pull (AGENTS.md
+// invariant #2).
 func cmdReceive(args []string) error {
 	dryRun := false
 	for _, arg := range args {
@@ -69,6 +78,15 @@ func cmdReceive(args []string) error {
 			return fmt.Errorf("sync-repo pull: %w", err)
 		}
 	}
+	// Fresh-join migration evaluates the POST-pull state (docs/hardening-plan.md
+	// WS-B "Migration semantics"): a pulled-but-unmigrated legacy-only repo is
+	// migrated silently with a one-line notice; mixed-state repos only get a
+	// hint. Skipped under --dry-run because silent migration commits.
+	if !dryRun {
+		if err := migrateIfNeededOnce(repo); err != nil {
+			return err
+		}
+	}
 	idx, err := openRepoIndex()
 	if err != nil {
 		return err
@@ -81,39 +99,61 @@ func cmdReceive(args []string) error {
 	if err != nil {
 		return err
 	}
-	exports, err := findExports(repo.Path)
+	refs, err := findRevisions(repo.Path)
 	if err != nil {
 		return err
 	}
+	groups := buildConflictGroups(refs)
 	ad := opencode.NewAdapter()
 	ad.TrustedPath = cfg.Producer.TrustedPath
 	ad.StrictCheck = cfg.Producer.StrictCheck
 	attempted := 0
 	blocked := 0
-	for _, ex := range exports {
-		digest, err := artifactDigest(ex.ExportPath)
-		if err != nil {
-			return fmt.Errorf("digest %s: %w", ex.SessionID, err)
+	for _, gi := range groups {
+		sessionID := gi.Group.SessionID
+		key := gi.Group.Key
+
+		// Conflicted: report explicitly, restore nothing, mark archive-only.
+		// A conflict never advances any acknowledgement to verified or to
+		// busy/failed retry semantics (plan §4).
+		if gi.Group.Conflicted {
+			for _, line := range conflictReport(gi) {
+				fmt.Println(line)
+			}
+			if dryRun {
+				fmt.Printf("DRY RUN: would mark %d revision(s) of %s archive-only; nothing restored.\n",
+					len(gi.Group.Revisions), sessionID)
+				continue
+			}
+			recordConflictArchiveOnly(local, idx, gi)
+			continue
 		}
+
+		// Single-revision group: normal guarded write-back flow.
+		ref, ok := primaryRef(gi.Refs, gi.Group.Revisions[0].Digest)
+		if !ok {
+			continue // unreachable: group members derive from these refs
+		}
+		digest := ref.Digest
 		title := ""
-		if im, err := readImportMeta(ex.ImportMetaPath); err == nil {
-			title = im.Title
+		if ref.Meta != nil {
+			title = ref.Meta.Title
 		}
-		candidates, err := idx.Resolve(session.CanonicalKey(ex.Key))
+		candidates, err := idx.Resolve(session.CanonicalKey(key))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "receive: action=resolve session=%s status=error error=%q\n", ex.SessionID, err)
+			fmt.Fprintf(os.Stderr, "receive: action=resolve session=%s status=error error=%q\n", sessionID, err)
 			continue
 		}
 		if len(candidates) == 0 {
-			fmt.Printf("Archived only: %s (%s) has no local clone for %s. Run agent-sync index after cloning.\n", ex.SessionID, title, ex.Key)
+			fmt.Printf("Archived only: %s (%s) has no local clone for %s. Run agent-sync index after cloning.\n", sessionID, title, key)
 			continue
 		}
 		paths := make([]string, 0, len(candidates))
 		for _, candidate := range candidates {
-			if err := repoindex.ValidateCandidate(session.CanonicalKey(ex.Key), candidate.LocalPath); err != nil {
-				fmt.Fprintf(os.Stderr, "receive: action=revalidate session=%s path=%q status=skip error=%q\n", ex.SessionID, candidate.LocalPath, err)
+			if err := repoindex.ValidateCandidate(session.CanonicalKey(key), candidate.LocalPath); err != nil {
+				fmt.Fprintf(os.Stderr, "receive: action=revalidate session=%s path=%q status=skip error=%q\n", sessionID, candidate.LocalPath, err)
 				if !dryRun {
-					_ = local.Put(receivestate.Outcome{ArtifactDigest: digest, SessionID: ex.SessionID, CandidatePath: candidate.LocalPath, Status: receivestate.StatusFailed, LastError: err.Error()})
+					_ = local.Put(receivestate.Outcome{ArtifactDigest: digest, SessionID: sessionID, CandidatePath: candidate.LocalPath, Status: receivestate.StatusFailed, LastError: err.Error()})
 				}
 				continue
 			}
@@ -121,13 +161,13 @@ func cmdReceive(args []string) error {
 			if err != nil {
 				return err
 			}
-			if ok && (previous.Status == receivestate.StatusVerified || previous.Status == receivestate.StatusDegraded) {
-				fmt.Printf("Already processed: %s at %s (%s).\n", ex.SessionID, candidate.LocalPath, previous.Status)
+			if ok && shouldSkip(previous) {
+				fmt.Printf("Already processed: %s at %s (%s).\n", sessionID, candidate.LocalPath, previous.Status)
 				continue
 			}
 			if ok && (previous.Status == receivestate.StatusBusy || previous.Status == receivestate.StatusFailed) &&
 				!previous.NextAttempt.IsZero() && time.Now().UTC().Before(previous.NextAttempt) {
-				fmt.Printf("Retry deferred: %s at %s until %s (%s).\n", ex.SessionID, candidate.LocalPath, previous.NextAttempt.UTC().Format(time.RFC3339), previous.Status)
+				fmt.Printf("Retry deferred: %s at %s until %s (%s).\n", sessionID, candidate.LocalPath, previous.NextAttempt.UTC().Format(time.RFC3339), previous.Status)
 				continue
 			}
 			paths = append(paths, candidate.LocalPath)
@@ -135,26 +175,29 @@ func cmdReceive(args []string) error {
 		if len(paths) == 0 {
 			continue
 		}
-		s := &session.Session{ID: ex.SessionID, Tool: session.ToolOpenCode, CanonicalKey: session.CanonicalKey(ex.Key), PayloadPath: ex.ExportPath}
+		s := &session.Session{ID: sessionID, Tool: session.ToolOpenCode, CanonicalKey: session.CanonicalKey(key), PayloadPath: ref.PayloadPath}
 		if err := ad.ValidateArtifact(s); err != nil {
 			blocked++
-			fmt.Fprintf(os.Stderr, "receive: action=validate session=%s status=failed error=%q\n", ex.SessionID, err)
+			fmt.Fprintf(os.Stderr, "receive: action=validate session=%s status=failed error=%q\n", sessionID, err)
 			if !dryRun {
 				for _, path := range paths {
-					_ = local.Put(receivestate.Outcome{ArtifactDigest: digest, SessionID: ex.SessionID, CandidatePath: path, Status: receivestate.StatusFailed, LastError: err.Error()})
+					_ = local.Put(receivestate.Outcome{ArtifactDigest: digest, SessionID: sessionID, CandidatePath: path, Status: receivestate.StatusFailed, LastError: err.Error()})
 				}
 			}
 			continue
 		}
 		if dryRun {
-			fmt.Printf("DRY RUN: would write back %s (%s) to %d validated clone(s).\n", ex.SessionID, title, len(paths))
+			fmt.Printf("DRY RUN: would write back %s (%s) to %d validated clone(s).\n", sessionID, title, len(paths))
 			continue
 		}
 		attempted++
-		fmt.Printf("Writing back %s (%s) to %d clone(s)...\n", ex.SessionID, title, len(paths))
+		fmt.Printf("Writing back %s (%s) to %d clone(s)...\n", sessionID, title, len(paths))
 		res := ad.BroadcastWriteBack(s, paths)
-		recordBroadcast(local, digest, ex.SessionID, res)
-		reportBroadcast(res, ex.SessionID, ex.Key)
+		recordBroadcast(local, digest, sessionID, res)
+		reportBroadcast(res, sessionID, key)
+	}
+	if hint := metaRepairHint(refs); hint != "" {
+		fmt.Println(hint)
 	}
 	if dryRun {
 		fmt.Println("Dry run complete; no OpenCode or local receive state was changed.")
@@ -164,6 +207,66 @@ func cmdReceive(args []string) error {
 		fmt.Println("No pending sessions required write-back.")
 	}
 	return nil
+}
+
+// recordConflictArchiveOnly marks every revision of a conflicted group
+// archive-only, keyed per digest×candidate-path. It resolves candidates via
+// the repo-index cache like any other session, but NEVER imports anything and
+// NEVER writes busy/failed retry state — a conflict supersedes stale retry
+// outcomes instead of feeding them.
+//
+// Detection must be repeatable without state churn: outcomes that already say
+// archive-only for that digest+path are read before writing and skipped, so
+// repeated runs print identical reports and leave last-attempt timestamps
+// untouched (docs/session-conflict-handling-plan.md §3).
+func recordConflictArchiveOnly(local *receivestate.Store, idx *repoindex.DB, gi conflictGroup) {
+	sessionID := gi.Group.SessionID
+	key := session.CanonicalKey(gi.Group.Key)
+	candidates, err := idx.Resolve(key)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "receive: action=resolve session=%s status=error error=%q\n", sessionID, err)
+		return
+	}
+	if len(candidates) == 0 {
+		title := ""
+		if ref, ok := primaryRef(gi.Refs, gi.Group.Revisions[0].Digest); ok && ref.Meta != nil {
+			title = ref.Meta.Title
+		}
+		fmt.Printf("Archived only: %s (%s) has no local clone for %s. Run agent-sync index after cloning.\n", sessionID, title, gi.Group.Key)
+		return
+	}
+	for _, rev := range gi.Group.Revisions {
+		for _, candidate := range candidates {
+			if err := repoindex.ValidateCandidate(key, candidate.LocalPath); err != nil {
+				fmt.Fprintf(os.Stderr, "receive: action=revalidate session=%s path=%q status=skip error=%q\n", sessionID, candidate.LocalPath, err)
+				continue
+			}
+			previous, ok, err := local.Get(rev.Digest, candidate.LocalPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "receive: action=read-state session=%s path=%q status=error error=%q\n", sessionID, candidate.LocalPath, err)
+				continue
+			}
+			if ok && (previous.Status == receivestate.StatusVerified || previous.Status == receivestate.StatusDegraded) {
+				// A human explicitly restored this revision via `recover`.
+				// Receive must never downgrade that decision back to
+				// archive-only — it only reports the sibling situation.
+				fmt.Printf("  restored: %s at %s (kept; recover chose this revision)\n", shortDigest(rev.Digest), candidate.LocalPath)
+				continue
+			}
+			if !ok || previous.Status != receivestate.StatusArchiveOnly {
+				if err := local.Put(receivestate.Outcome{
+					ArtifactDigest: rev.Digest,
+					SessionID:      sessionID,
+					CandidatePath:  candidate.LocalPath,
+					Status:         receivestate.StatusArchiveOnly,
+				}); err != nil {
+					fmt.Fprintf(os.Stderr, "receive: action=record path=%q status=error error=%q\n", candidate.LocalPath, err)
+					continue
+				}
+			}
+			fmt.Printf("  archive-only: %s at %s (conflict; not restored)\n", shortDigest(rev.Digest), candidate.LocalPath)
+		}
+	}
 }
 
 // reportBroadcast prints the write-back outcome, explicitly logging the
@@ -210,15 +313,6 @@ func recordBroadcast(local *receivestate.Store, digest, sessionID string, res op
 	}
 }
 
-func artifactDigest(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
 // openRepoIndex opens the repo-index cache DB.
 func openRepoIndex() (*repoindex.DB, error) {
 	p, err := repoindex.DefaultPath()
@@ -226,49 +320,4 @@ func openRepoIndex() (*repoindex.DB, error) {
 		return nil, err
 	}
 	return repoindex.Open(p)
-}
-
-type exportRef struct {
-	SessionID      string
-	Key            string
-	ExportPath     string
-	ImportMetaPath string
-	HasMeta        bool
-}
-
-// findExports walks <repo>/opencode/*/export/*.json and returns references.
-func findExports(repoPath string) ([]exportRef, error) {
-	base := filepath.Join(repoPath, "opencode")
-	var refs []exportRef
-	err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(d.Name(), ".json") || !strings.Contains(path, string(filepath.Separator)+"export"+string(filepath.Separator)) {
-			return nil
-		}
-		sessionID := strings.TrimSuffix(d.Name(), ".json")
-		key := filepath.Base(filepath.Dir(filepath.Dir(path)))
-		metaPath := filepath.Join(filepath.Dir(filepath.Dir(path)), "import-meta", d.Name())
-		_, metaErr := os.Stat(metaPath)
-		refs = append(refs, exportRef{
-			SessionID:      sessionID,
-			Key:            key,
-			ExportPath:     path,
-			ImportMetaPath: metaPath,
-			HasMeta:        metaErr == nil,
-		})
-		return nil
-	})
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i].SessionID < refs[j].SessionID })
-	return refs, nil
 }
