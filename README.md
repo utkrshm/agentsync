@@ -123,17 +123,55 @@ agent-sync pull               # fetch + fast-forward the sync repo only
 
 ## Roadmap
 
-- [x] One-command setup backed by your own git storage
-- [x] On-demand send / receive / pull of sessions between machines
-- [x] One-shot resume: pull code, restore sessions, pick one to continue
-- [x] Automatic pulls when you open a shell (silent, rate-limited trigger)
-- [x] Immutable, content-addressed revisions — history is never overwritten
-- [x] Same-session conflict detection, inspection, and guided recovery
-- [x] Safety-first restore: live-process guard, exact version pinning, dry-run
-- [x] Multi-clone aware restores across copies of the same project
-- [ ] Watcher daemon for automatic session capture while you work
-- [ ] Service-manager integration for the background daemon
-- [ ] Interactive terminal UI to browse all synced sessions
-- [ ] Full-text search across your entire session history
-- [ ] Support for additional AI coding agents
-- [ ] Friendlier status/health checks and error messages
+AgentSync is being built in stages. The first stage makes it possible to move
+an OpenCode conversation between computers safely. The next stages remove
+manual steps, make failures easier to understand and recover from, and bring
+the same workflow to more coding tools.
+
+### Current roadmap
+
+- [x] **Set up a private session repository.** Point AgentSync at a Git
+  repository you control, or use a local repository without a server.
+- [x] **Save and restore OpenCode sessions.** `send` creates a portable export
+  of a conversation; `receive` brings it onto another computer without
+  copying OpenCode's private database files.
+- [x] **Resume in one step.** `resume` pulls the latest project code, restores
+  available sessions, and lets you choose which conversation to continue.
+- [x] **Keep a trustworthy history.** Each saved revision is retained, so a
+  later save cannot silently replace earlier work. The sync repository uses
+  timestamped Git commits and refuses to overwrite a diverged history.
+- [x] **Handle conflicts before they become data loss.** Different versions
+  of the same conversation are preserved and reported for inspection instead
+  of being merged or discarded automatically.
+- [x] **Restore safely.** AgentSync previews changes when requested, checks
+  tool compatibility, avoids writing while OpenCode is running for the
+  current user, and reports partial or postponed restores honestly.
+- [x] **Find every matching project copy.** When a project exists in more than
+  one local folder, AgentSync can target each matching copy independently.
+- [ ] **Make continuous syncing dependable.** Capture sessions in the
+  background as they change, remember exactly what was successfully saved,
+  retry temporary network or import failures, and keep those retries after a
+  restart.
+- [ ] **Finish the safety controls for unattended use.** Add clear status and
+  diagnostic commands, a real undo path for write-back, and final validation
+  of the background service across login, reboot, and crash recovery.
+- [ ] **Add Codex CLI capture.** Save Codex conversations as they are written,
+  using their original JSONL records while keeping the same project grouping,
+  Git transport, conflict detection, and search model.
+
+### Future scope
+
+- [ ] **Browse and search your history.** Add a fast terminal interface for
+  listing sessions by project, date, and tool, with full-text search for
+  questions or solutions you remember but cannot place.
+- [ ] **Restore Codex sessions.** Once capture is proven, investigate and add
+  guarded write-back so Codex conversations can be resumed on another
+  computer. This requires extra compatibility checks because Codex does not
+  provide the same export/import interface as OpenCode.
+- [ ] **Support more coding tools.** Claude Code and the CLI version of
+  Antigravity may follow after their storage formats and resume behavior have
+  been verified. Support will begin with capture and browsing where safe;
+  resume support will not be assumed.
+- [ ] **Make everyday use quieter and clearer.** Improve progress reporting,
+  privacy controls, recovery guidance, and the setup of the background
+  service without hiding what AgentSync did or did not sync.
