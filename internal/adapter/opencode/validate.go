@@ -83,27 +83,33 @@ func parseExportInfo(data []byte) (ExportInfo, error) {
 // Locations that match none of these shapes are rejected outright.
 func CheckArtifactFile(absPath, relPath string) error {
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
-	if len(parts) < 2 || parts[0] != "opencode" {
+	n := len(parts)
+	if n < 4 || parts[0] != "opencode" {
 		return fmt.Errorf(
 			"unexpected location %s (want opencode/<project>/... artifact paths)",
 			relPath)
 	}
-	switch {
-	case len(parts) == 4:
-		return checkLegacyArtifact(absPath, relPath, parts)
-	case len(parts) == 6 && parts[2] == "sessions" && parts[4] == "revisions":
-		return checkRevisionArtifact(absPath, relPath, parts)
-	default:
-		return fmt.Errorf(
-			"unrecognized opencode/ location %s — expected export/, import-meta/, or sessions/<sid>/revisions/<digest>.json",
-			relPath)
+	// Anchor on the path TAIL, not fixed segment indexes: canonical keys may
+	// themselves contain slashes (the _unmapped/<path> sentinel guarantees
+	// it), so everything between "opencode/" and the artifact shape is key.
+	// Tail shapes:
+	//   legacy:   [.., "export"|"import-meta", <session-id>.json]
+	//   revision: [.., "sessions", <sid>, "revisions", <digest>[.meta].json]
+	file := parts[n-1]
+	if n >= 6 && parts[n-4] == "sessions" && parts[n-2] == "revisions" {
+		return checkRevisionArtifact(absPath, relPath, parts[n-3], file)
 	}
+	if kind := parts[n-2]; kind == "export" || kind == "import-meta" {
+		return checkLegacyArtifact(absPath, relPath, kind, file)
+	}
+	return fmt.Errorf(
+		"unrecognized opencode/ location %s — expected export/, import-meta/, or sessions/<sid>/revisions/<digest>.json",
+		relPath)
 }
 
 // checkLegacyArtifact validates the pre-revisions flat layout: full exports
 // under export/ and their import-meta sidecars under import-meta/.
-func checkLegacyArtifact(absPath, relPath string, parts []string) error {
-	name := parts[3]
+func checkLegacyArtifact(absPath, relPath, kind, name string) error {
 	stem := strings.TrimSuffix(name, ".json")
 	if stem == "" || stem == name {
 		return fmt.Errorf("%s: expected a .json file named after its session id", relPath)
@@ -112,7 +118,7 @@ func checkLegacyArtifact(absPath, relPath string, parts []string) error {
 	if err != nil {
 		return err
 	}
-	switch parts[2] {
+	switch kind {
 	case "export":
 		if _, verr := ValidateExport(data, stem); verr != nil {
 			return verr
@@ -128,7 +134,7 @@ func checkLegacyArtifact(absPath, relPath string, parts []string) error {
 			return fmt.Errorf("import-meta %s: id %q does not match filename", relPath, m.ID)
 		}
 	default:
-		return fmt.Errorf("unrecognized opencode/ subdirectory %q — expected export or import-meta", parts[2])
+		return fmt.Errorf("unrecognized opencode/ subdirectory %q — expected export or import-meta", kind)
 	}
 	return nil
 }
@@ -137,8 +143,10 @@ func checkLegacyArtifact(absPath, relPath string, parts []string) error {
 // The filename carries the sha256 digest of the payload bytes, so a payload's
 // content can be verified without any external state; a sidecar must agree
 // with both its digest and its session path segment.
-func checkRevisionArtifact(absPath, relPath string, parts []string) error {
-	sessionID, name := parts[3], parts[5]
+func checkRevisionArtifact(absPath, relPath, sessionID, name string) error {
+	if sessionID == "" || sessionID == "." || sessionID == ".." {
+		return fmt.Errorf("%s: invalid session directory", relPath)
+	}
 	if sessionID == "" || sessionID == "." || sessionID == ".." {
 		return fmt.Errorf("%s: invalid session directory", relPath)
 	}

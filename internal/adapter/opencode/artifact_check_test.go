@@ -150,3 +150,27 @@ func TestCheckArtifactFile(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckArtifactFileNestedSlashKeys(t *testing.T) {
+	dir := t.TempDir()
+	nestedRel := "opencode/_unmapped/home/dev/hi/bye/sessions/ses_n/revisions/" +
+		"1111111111111111111111111111111111111111111111111111111111111111.json"
+	payload := []byte(`{"info":{"id":"ses_n","projectID":"p","directory":"/d","version":"1.0"}}`)
+	abs := filepath.Join(dir, filepath.FromSlash(nestedRel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	digest := hex.EncodeToString(sum[:])
+	realRel := "opencode/_unmapped/home/dev/hi/bye/sessions/ses_n/revisions/" + digest + ".json"
+	if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(realRel)), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckArtifactFile(filepath.Join(dir, filepath.FromSlash(realRel)), realRel); err != nil {
+		t.Fatalf("nested-key revision payload must validate: %v", err)
+	}
+	// And the same bytes under a WRONG digest name still fail.
+	if err := CheckArtifactFile(abs, nestedRel); err == nil {
+		t.Fatal("mismatched digest filename must fail regardless of key shape")
+	}
+}

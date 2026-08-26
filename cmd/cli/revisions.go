@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,36 +38,73 @@ type revisionRef struct {
 // duplicates are collapsed. A missing opencode/ tree yields no refs, not an
 // error.
 func findRevisions(repoPath string) ([]revisionRef, error) {
-	base := filepath.Join(repoPath, "opencode")
-	keyEntries, err := os.ReadDir(base)
+	roots, err := storageRoots(repoPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
-
 	var refs []revisionRef
-	for _, keyEntry := range keyEntries {
-		if !keyEntry.IsDir() {
-			continue
-		}
-		key := keyEntry.Name()
-		keyPath := filepath.Join(base, key)
-
-		legacyRefs, err := walkLegacyLayout(key, keyPath)
+	for _, root := range roots {
+		legacyRefs, err := walkLegacyLayout(root.Key, root.Path)
 		if err != nil {
 			return nil, err
 		}
 		refs = append(refs, legacyRefs...)
 
-		newRefs, err := walkRevisionLayout(key, keyPath)
+		newRefs, err := walkRevisionLayout(root.Key, root.Path)
 		if err != nil {
 			return nil, err
 		}
 		refs = append(refs, newRefs...)
 	}
 	return sortAndDedupe(refs), nil
+}
+
+// keyRoot is one storage root: a canonical key (which may itself contain
+// slashes — the _unmapped/<path> sentinel guarantees it) and its directory.
+type keyRoot struct {
+	Key  string // slash-separated, relative to opencode/
+	Path string // absolute directory of that key
+}
+
+// storageRoots lists every opencode/**/ directory that directly contains an
+// export/, import-meta/ or sessions/ subdirectory. Key discovery is
+// depth-agnostic on purpose: single-level ReadDir loops silently hid every
+// session whose canonical key contained a slash (e.g. _unmapped/home/dev/x),
+// making it invisible to receive, conflicts and migration alike.
+func storageRoots(repoPath string) ([]keyRoot, error) {
+	base := filepath.Join(repoPath, "opencode")
+	if _, err := os.Stat(base); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var roots []keyRoot
+	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(base, path)
+		if rerr != nil || rel == "." {
+			return nil
+		}
+		hasSub := func(name string) bool {
+			fi, e := os.Stat(filepath.Join(path, name))
+			return e == nil && fi.IsDir()
+		}
+		if hasSub("export") || hasSub("import-meta") || hasSub("sessions") {
+			roots = append(roots, keyRoot{Key: filepath.ToSlash(rel), Path: path})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].Key < roots[j].Key })
+	return roots, nil
 }
 
 // sortAndDedupe orders refs deterministically by (Key, SessionID, Digest)

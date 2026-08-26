@@ -84,24 +84,17 @@ type legacyExport struct {
 // tree yields no candidates, not an error.
 func scanLegacyExports(root string) ([]legacyExport, error) {
 	base := filepath.Join(root, "opencode")
-	keyEntries, err := os.ReadDir(base)
+	roots, err := storageRoots(root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	var out []legacyExport
-	for _, keyEntry := range keyEntries {
-		if !keyEntry.IsDir() {
-			continue
-		}
-		key := keyEntry.Name()
-		exportDir := filepath.Join(base, key, "export")
+	for _, kr := range roots {
+		exportDir := filepath.Join(kr.Path, "export")
 		files, err := os.ReadDir(exportDir)
 		if err != nil {
 			if os.IsNotExist(err) {
-				continue
+				continue // revisions-only root
 			}
 			return nil, err
 		}
@@ -111,10 +104,10 @@ func scanLegacyExports(root string) ([]legacyExport, error) {
 				continue
 			}
 			out = append(out, legacyExport{
-				Key:        key,
+				Key:        kr.Key,
 				SessionID:  strings.TrimSuffix(name, ".json"),
 				Payload:    filepath.Join(exportDir, name),
-				ImportMeta: filepath.Join(base, key, "import-meta", name),
+				ImportMeta: filepath.Join(base, kr.Key, "import-meta", name),
 			})
 		}
 	}
@@ -130,20 +123,13 @@ func scanLegacyExports(root string) ([]legacyExport, error) {
 // countSessionsDirs counts opencode/<key>/sessions directories under root.
 // Any such directory means the revisions layout is in use somewhere.
 func countSessionsDirs(root string) (int, error) {
-	base := filepath.Join(root, "opencode")
-	keyEntries, err := os.ReadDir(base)
+	roots, err := storageRoots(root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
 		return 0, err
 	}
 	n := 0
-	for _, keyEntry := range keyEntries {
-		if !keyEntry.IsDir() {
-			continue
-		}
-		if fi, err := os.Stat(filepath.Join(base, keyEntry.Name(), "sessions")); err == nil && fi.IsDir() {
+	for _, kr := range roots {
+		if fi, err := os.Stat(filepath.Join(kr.Path, "sessions")); err == nil && fi.IsDir() {
 			n++
 		}
 	}

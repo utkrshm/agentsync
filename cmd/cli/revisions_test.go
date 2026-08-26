@@ -247,3 +247,30 @@ func TestSortAndDedupeCollapsesExactDuplicates(t *testing.T) {
 		t.Errorf("dedupe lost a variant: meta=%v nometa=%v bb=%v (%#v)", sawMeta, sawNoMeta, sawBB, got)
 	}
 }
+
+// Regression: canonical keys may contain slashes (_unmapped/<path>); a
+// single-level key scan made such sessions invisible to every consumer.
+func TestFindRevisionsNestedSlashKeys(t *testing.T) {
+	base := t.TempDir()
+	syncRepo := filepath.Join(base, "repo")
+	writeRevisionFixture(t, syncRepo, "_unmapped/home/dev/hi/bye", "ses_nested", "", "(untitled)",
+		time.Date(2026, 8, 21, 21, 8, 56, 0, time.UTC), "1.18.18", exportFixture("ses_nested"))
+	// A plain single-segment key must keep working alongside it.
+	writeRevisionFixture(t, syncRepo, "plain-key", "ses_plain", "", "(untitled)",
+		time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC), "1.18.18", exportFixture("ses_plain"))
+
+	refs, err := findRevisions(syncRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]bool{}
+	for _, r := range refs {
+		keys[r.Key+"/"+r.SessionID] = true
+	}
+	if !keys["_unmapped/home/dev/hi/bye/ses_nested"] {
+		t.Errorf("nested-slash key missing from walker: %#v", keys)
+	}
+	if !keys["plain-key/ses_plain"] {
+		t.Errorf("plain key lost by depth-agnostic walk: %#v", keys)
+	}
+}
