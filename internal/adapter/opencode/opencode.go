@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 
+	"agentsync/internal/canonicalkey"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -262,15 +264,28 @@ func mustDBPath() string {
 }
 
 // deriveProjectID produces a stable project id for targetDir by hashing the
-// canonical key or, failing that, the path itself.
+// normalized git remote or, failing that, the path itself. The surrogate is
+// transport-invariant since it hashes canonicalkey.NormalizeRemote output —
+// scp and https spellings of one origin map to one id. Tradeoff: on devices
+// upgraded across this change, OpenCode may create ONE fresh project row on
+// next import (a cosmetic duplicate in that device's DB) as ids converge.
 func deriveProjectID(targetDir string) (string, error) {
 	// Try git remote.
 	cmd := exec.Command("git", "-C", targetDir, "remote", "get-url", "origin")
 	out, err := cmd.Output()
 	if err == nil && strings.TrimSpace(string(out)) != "" {
-		return hashString(strings.TrimSpace(string(out))), nil
+		return deriveSurrogateFromRemote(string(out)), nil
 	}
 	return hashString(targetDir), nil
+}
+
+// deriveSurrogateFromRemote hashes the transport-normalized form of a remote
+// URL. Pure function of its input; all remote spelling decisions are delegated
+// to canonicalkey.NormalizeRemote so this stays a thin projection.
+func deriveSurrogateFromRemote(url string) string {
+	host, segs := canonicalkey.NormalizeRemote(strings.TrimSpace(url))
+	surrogateInput := strings.Join(append([]string{host}, segs...), "|")
+	return hashString(surrogateInput)
 }
 
 // IsToolRunning reports whether an opencode process is running for the

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"agentsync/internal/session"
 )
 
 // helper to init a git repo at path and add a remote.
@@ -114,4 +116,137 @@ func sanitize(r rune) rune {
 		return r
 	}
 	return '?'
+}
+
+// TestKeyFromURLEquivalenceMatrix pins THE core guarantee of NormalizeRemote:
+// every transport spelling of one origin produces the identical key.
+func TestKeyFromURLEquivalenceMatrix(t *testing.T) {
+	const want = "github.com-user-repo"
+	for _, remote := range []string{
+		"git@github.com:user/repo.git",
+		"ssh://git@github.com/user/repo.git",
+		"https://github.com/user/repo.git",
+		"https://Utkarsh@github.com/user/repo.git/",
+		"ssh://git@github.com:22/user/repo.git",
+		"HTTPS://GITHUB.COM/USER/REPO.GIT",
+		"github.com:user/repo",
+	} {
+		t.Run(remote, func(t *testing.T) {
+			if got := keyFromURL(remote); got != want {
+				t.Errorf("keyFromURL(%q) = %q, want %q", remote, got, want)
+			}
+		})
+	}
+}
+
+func TestNormalizeRemotePortEquivalence(t *testing.T) {
+	base := keyFromURL("git@github.com:user/repo.git")
+	for _, withPort := range []string{
+		"ssh://git@github.com:22/user/repo.git",
+		"ssh://git@github.com:2222/user/repo.git",
+		"https://github.com:443/user/repo.git",
+	} {
+		if got := keyFromURL(withPort); got != base {
+			t.Errorf("keyFromURL(%q) = %q, want %q (ports are stripped, not identity)", withPort, got, base)
+		}
+	}
+	if host, _ := NormalizeRemote("ssh://git@GitHub.com:443/x/y"); host != "github.com" {
+		t.Errorf("NormalizeRemote port/lowercase host = %q, want %q", host, "github.com")
+	}
+}
+
+func TestNormalizeRemoteSubgroupDepthDistinct(t *testing.T) {
+	sub := keyFromURL("https://gitlab.com/g/sub/r")
+	noSub := keyFromURL("https://gitlab.com/g/r")
+	if sub == noSub {
+		t.Errorf("subgroup depth must stay distinct: %q collided with %q", sub, noSub)
+	}
+}
+
+func TestNormalizeRemoteNoOverCollapsing(t *testing.T) {
+	pairs := [][2]string{
+		{"git@github.com:owner-a/repo.git", "git@github.com:owner-b/repo.git"},
+		{"git@github.com:user/repo-one.git", "git@github.com:user/repo-two.git"},
+	}
+	for _, p := range pairs {
+		a, b := keyFromURL(p[0]), keyFromURL(p[1])
+		if a == b {
+			t.Errorf("distinct projects must stay distinct: %q and %q both -> %q", p[0], p[1], a)
+		}
+	}
+}
+
+// TestKeyFromURLEmptyHostPinsCurrentBehavior documents and pins degenerate
+// inputs that never had a real host under scp-era parsing: the raw string
+// flowed into the join unchanged except separators flattening to "-". These
+// bytes are load-bearing for existing on-disk keys — do not "fix".
+func TestKeyFromURLEmptyHostPinsCurrentBehavior(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                 "",
+		"/local/path/repo": "-local-path-repo",
+		"plainname":        "plainname",
+	} {
+		if got := keyFromURL(in); got != want {
+			t.Errorf("keyFromURL(%q) = %q, want %q (pinned current behavior)", in, got, want)
+		}
+	}
+	// Resolve still passes these through slug(); slugging must not alter them
+	// (they're already slug-safe apart from separators that don't appear here).
+	for in, want := range map[string]string{
+		"/local/path/repo": "-local-path-repo",
+		"plainname":        "plainname",
+	} {
+		if got := slug(keyFromURL(in)); got != session.CanonicalKey(want) {
+			t.Errorf("slug(keyFromURL(%q)) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeRemoteUnitTable(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantSegs []string
+	}{
+		// host lowercase + numeric-only ":port" strip, in authority position.
+		{"HTTPS://GitHub.com:443/", "github.com", nil},
+		{"ssh://git@GitHub.com:443/x/y", "github.com", []string{"x", "y"}},
+		{"https://User@Example.COM:8443/A/B", "example.com", []string{"a", "b"}},
+		// Bare "host:port-ish" input has no authority section (git's scp
+		// grammar starts the path at the first ":"), so digits stay a segment;
+		// only host slots get port-stripped.
+		{"GitHub.com:443/foo", "github.com", []string{"443", "foo"}},
+		// "."/".." segment drops and repeated-slash collapse on real URL
+		// paths.
+		{"https://h.example/a/./b/../c", "h.example", []string{"a", "b", "c"}},
+		{"https://h//a///b", "h", []string{"a", "b"}},
+		// Degenerate (no-host) inputs: separator positions survive verbatim
+		// — empty parts and "."/".." stay, unlike host-carrying remotes.
+		// NOTE the global trailing-"/"/".git" trim loop runs before this
+		// branch, so trailing separators on bare paths are already gone.
+		{"/x/./y/../z", "", []string{"", "x", ".", "y", "..", "z"}},
+		{"/p//q///r/", "", []string{"", "p", "", "q", "", "", "r"}},
+		// trailing ".git"/"/" multi-strip loop.
+		{"git@gitlab.com:g/r.git///", "gitlab.com", []string{"g", "r"}},
+		{"u.git/x.git//", "", []string{"u.git", "x"}},
+		{".git", "", []string{""}},
+	}
+	for _, tc := range cases {
+		host, segs := NormalizeRemote(tc.in)
+		if host != tc.wantHost || !equalStrings(segs, tc.wantSegs) {
+			t.Errorf("NormalizeRemote(%q) = (%q, %v), want (%q, %v)", tc.in, host, segs, tc.wantHost, tc.wantSegs)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

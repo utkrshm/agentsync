@@ -118,16 +118,130 @@ func alias(localPath string) (session.CanonicalKey, bool) {
 	return "", false
 }
 
-// keyFromURL normalizes a remote URL into a stable slug.
-func keyFromURL(url string) string {
-	// Strip optional scheme/user@ and ".git" suffix, keep host/path.
-	u := url
-	if i := strings.LastIndex(u, "@"); i >= 0 && !strings.Contains(u[:i], "://") {
-		u = u[i+1:]
+// NormalizeRemote is THE single place remote URLs are interpreted anywhere in
+// the codebase: every transport spelling of one repository must reduce to the
+// same (host, segments) pair.
+//   - trims space; repeatedly drops trailing "/" and ".git"
+//   - "scheme://rest"  → strip scheme; if "@" occurs before the first "/",
+//     drop everything through it (userinfo)
+//   - SCP form "[user@]host:path" → drop through last "@", split first ":"
+//   - host: lowercased; ":port" suffix stripped (numeric only)
+//   - segments: non-empty path parts; "." and ".." dropped; FULL retention
+//     (GitLab-style subgroups must stay unique)
+//
+// Case folding applies to both host and segments: a repository spelled with
+// different casing across transports (HTTPS://GITHUB.COM/USER/REPO.GIT vs
+// git@github.com:user/repo.git) must land on ONE identity, so the fold cannot
+// stop at the host.
+//
+// Degenerate inputs with no host at all (bare paths, empty strings) return an
+// empty host; their segments keep the original slash positions verbatim (they
+// may contain empty parts) so callers reproduce today's byte-for-byte output —
+// see keyFromURL.
+func NormalizeRemote(raw string) (host string, segments []string) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+
+	// Repeatedly drop trailing "/" and ".git" so mixed tails like
+	// ".../repo.git//" fully collapse.
+	for trimmed := true; trimmed && s != ""; {
+		trimmed = false
+		if i := len(s); i > 0 && s[i-1] == '/' {
+			s = strings.TrimRight(s, "/")
+			trimmed = true
+			continue
+		}
+		if strings.HasSuffix(s, ".git") {
+			s = strings.TrimSuffix(s, ".git")
+			trimmed = true
+		}
 	}
-	u = strings.TrimSuffix(u, ".git")
-	u = strings.TrimPrefix(u, "git@")
-	return strings.ReplaceAll(u, "/", "-")
+
+	var hostPart, pathPart string
+	if i := strings.Index(s, "://"); i >= 0 {
+		// scheme://rest — work on the remainder after the scheme.
+		rest := s[i+3:]
+		var path string
+		if slash := strings.Index(rest, "/"); slash >= 0 {
+			path = rest[slash:]
+			rest = rest[:slash]
+		}
+		if at := strings.Index(rest, "@"); at >= 0 {
+			rest = rest[at+1:] // userinfo
+		}
+		hostPart = rest
+		pathPart = path
+	} else {
+		// SCP form "[user@]host:path".
+		if at := strings.LastIndex(s, "@"); at >= 0 {
+			s = s[at+1:]
+		}
+		if colon := strings.Index(s, ":"); colon >= 0 {
+			hostPart = s[:colon]
+			pathPart = s[colon+1:]
+		} else {
+			// No host:path structure: degenerate bare path or bare name.
+			// Historic behavior pushed the whole string through a plain
+			// "/"→"-" mapping; keyFromURL reproduces those bytes exactly by
+			// keeping EMPTY separator positions in the segments, so a leading
+			// or repeated slash still maps to its dash.
+			return "", strings.Split(s, "/")
+		}
+	}
+
+	return stripNumericPort(hostPart), splitSegments(pathPart)
+}
+
+// stripNumericPort removes a single trailing ":<digits>" from host. Non-numeric
+// or empty port suffixes are left alone.
+func stripNumericPort(host string) string {
+	i := strings.LastIndex(host, ":")
+	if i <= 0 || !allDigits(host[i+1:]) {
+		return host
+	}
+	return host[:i]
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// splitSegments keeps non-empty path parts, dropping "." and "..".
+func splitSegments(path string) []string {
+	var segs []string
+	for _, part := range strings.Split(path, "/") {
+		switch part {
+		case "", ".", "..":
+			continue
+		default:
+			segs = append(segs, part)
+		}
+	}
+	return segs
+}
+
+// keyFromURL projects a normalized remote onto today's scp-era flat key format
+// ("host-seg-seg"). Existing stored scp-era keys are unchanged byte-for-byte
+// (zero migration): Resolve still passes this through slug(), which only ever
+// sanitized the ":" that used to survive here. Cross-transport spellings that
+// previously diverged ("ssh---…", "https---…") now converge on it.
+func keyFromURL(url string) string {
+	host, segs := NormalizeRemote(url)
+	if host == "" {
+		// Degenerate bare-path input: segments carry every separator
+		// position verbatim, so joining them alone reproduces today's
+		// plain "/"→"-" mapped bytes.
+		return strings.Join(segs, "-")
+	}
+	full := append([]string{host}, segs...)
+	return strings.Join(full, "-")
 }
 
 // slug makes a key filesystem-safe for use as a directory name.
