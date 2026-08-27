@@ -22,6 +22,7 @@ Commands:
   recover        restore one chosen revision of a conflicted session
   revisions      inspect stored session revisions (list)
   conflicts      report same-session conflict groups
+  rekey          move one project's stored revisions under another canonical key
   help           show help for all commands or one command
 
 Config lives at ~/.config/agent-sync/config.toml (see ` + "`agent-sync help init`" + `).
@@ -82,6 +83,8 @@ func main() {
 		err = cmdRevisions(rest)
 	case "conflicts":
 		err = cmdConflicts(rest)
+	case "rekey":
+		err = cmdRekey(rest)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-sync %s: %v\n", cmd, err)
@@ -102,6 +105,7 @@ var commandHelp = map[string]string{
 	"recover":        recoverUsage,
 	"revisions":      revisionsUsage,
 	"conflicts":      conflictsUsage,
+	"rekey":          rekeyUsage,
 }
 
 func hasHelpFlag(args []string) bool {

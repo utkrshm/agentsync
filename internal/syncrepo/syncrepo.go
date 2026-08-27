@@ -179,21 +179,43 @@ func (r *Repo) HasRemote() bool {
 // the commit proceeds with whatever was staged. If the working tree has
 // nothing new to stage, it returns ErrNoChanges.
 func (r *Repo) Commit(tool, sessionID, ts string) (version int, err error) {
+	version, err = r.stageSyncOwnedAndVersion()
+	if err != nil {
+		return 0, err
+	}
+	return r.commitStaged(version, fmt.Sprintf("sync: %s %s v%d %s", tool, sessionID, version, ts))
+}
+
+// CommitMessage behaves exactly like Commit but records the given literal
+// subject instead of the sync-message format. Administrative operations that
+// relocate already-committed content (e.g. `agent-sync rekey`) keep Commit's
+// scoped staging, per-file artifact validation, and foreign-path warnings
+// while naming their own operation in history.
+func (r *Repo) CommitMessage(msg string) (version int, err error) {
+	version, err = r.stageSyncOwnedAndVersion()
+	if err != nil {
+		return 0, err
+	}
+	return r.commitStaged(version, msg)
+}
+
+// stageSyncOwnedAndVersion performs the shared pre-commit work: scoped
+// staging of exactly the changed sync-owned paths, foreign-path warnings,
+// and version derivation from history length.
+func (r *Repo) stageSyncOwnedAndVersion() (int, error) {
 	if err := r.stageSyncOwned(); err != nil {
 		return 0, err
 	}
 	r.warnForeignPaths()
-	version, err = r.nextVersion()
-	if err != nil {
-		return 0, err
-	}
-	msg := fmt.Sprintf("sync: %s %s v%d %s", tool, sessionID, version, ts)
+	return r.nextVersion()
+}
+
+// commitStaged creates the commit for whatever is already staged and maps
+// git's "nothing to commit" outcomes onto ErrNoChanges (a no-op for a sync
+// repo, not a failure).
+func (r *Repo) commitStaged(version int, msg string) (int, error) {
 	out, err := r.git("commit", "-m", msg)
 	if err != nil {
-		// "nothing to commit": staged tree identical to HEAD.
-		// "nothing added to commit but untracked files present": only
-		// foreign paths changed and nothing sync-owned was staged. Both are
-		// no-ops for a sync repo, not failures.
 		low := strings.ToLower(out)
 		if strings.Contains(low, "nothing to commit") || strings.Contains(low, "nothing added to commit") {
 			return version, ErrNoChanges
