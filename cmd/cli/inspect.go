@@ -271,7 +271,20 @@ func cmdConflicts(args []string) error {
 		return nil
 	}
 
+	// Verdict blocks print as distinct paragraphs (docs/sync-rekey-
+	// collapse-plan.md Step 1): one blank line separates every pair of
+	// adjacent top-level blocks — clean verdicts, CONFLICT reports, the
+	// metadata repair hint, the totals line — while the very first block
+	// starts flush so no stray leading blank appears.
+	started := false
+	separateBlocks := func() {
+		if started {
+			fmt.Println()
+		}
+		started = true
+	}
 	for _, entry := range out {
+		separateBlocks()
 		if !entry.Conflicted {
 			fmt.Printf("clean: %s (%d revision(s))\n", entry.SessionID, len(entry.Revisions))
 			continue
@@ -282,8 +295,10 @@ func cmdConflicts(args []string) error {
 		}
 	}
 	if hint := metaRepairHint(refs); hint != "" {
+		separateBlocks()
 		fmt.Println(hint)
 	}
+	separateBlocks()
 	fmt.Printf("%d conflicted session(s), %d clean\n", conflictedCount, cleanCount)
 	return nil
 }

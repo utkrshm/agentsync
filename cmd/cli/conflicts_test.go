@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -222,6 +223,34 @@ func TestConflictReportShape(t *testing.T) {
 	}
 	if !reflect.DeepEqual(lines, want) {
 		t.Fatalf("report:\n%s\nwant:\n%s", stringsJoin(lines), stringsJoin(want))
+	}
+}
+
+// Paragraph contract for `agent-sync conflicts` human output (plan doc Step
+// 1): verdict blocks read as distinct paragraphs — one blank line between
+// every pair of adjacent top-level blocks and before the totals line, and
+// none before the very first block. The conflicted fixture group sorts first
+// ("fixture-key" < "no-clone-key"), so the report opens with its block.
+func TestConflictsReportBlockSeparation(t *testing.T) {
+	conflictReceiveEnv(t)
+
+	out, err := runCmdCapture(t, func() error { return cmdConflicts(nil) })
+	if err != nil {
+		t.Fatalf("conflicts: %v", err)
+	}
+	if !strings.HasPrefix(out, "CONFLICT: ses_conf has 2 preserved revisions — nothing restored\n") {
+		t.Errorf("first block must start flush with the conflict report:\n%q", out)
+	}
+	wantTail := "Run `agent-sync recover ses_conf` to restore a chosen revision.\n" +
+		"\n" +
+		"clean: ses_solo (1 revision(s))\n" +
+		"\n" +
+		"1 conflicted session(s), 1 clean\n"
+	if !strings.HasSuffix(out, wantTail) {
+		t.Fatalf("block separation wrong.\ngot tail:\n%q\nwant tail:\n%q", out[len(out)-200:], wantTail)
+	}
+	if strings.Contains(out, "\n\n\n") {
+		t.Errorf("separator doubling must never appear:\n%s", out)
 	}
 }
 

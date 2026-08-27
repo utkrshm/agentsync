@@ -18,7 +18,7 @@ Commands:
   resume         pull code repo, receive sessions, pick one to resume
   pull           fetch + fast-forward the sync repo only
   index          scan [repoindex] roots to find local clones for write-back
-  migrate-layout move legacy exports into the immutable revisions layout
+  migrate-layout move legacy exports layout (v0.1) into the immutable revisions layout
   recover        restore one chosen revision of a conflicted session
   revisions      inspect stored session revisions (list)
   conflicts      report same-session conflict groups

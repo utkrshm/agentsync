@@ -117,6 +117,10 @@ func cmdReceive(args []string) error {
 		// A conflict never advances any acknowledgement to verified or to
 		// busy/failed retry semantics (plan §4).
 		if gi.Group.Conflicted {
+			// Cheap parity with `conflicts`: offset the multi-line report
+			// from whatever neighbor lines precede it (another session's
+			// outcome or the start of the run).
+			fmt.Println()
 			for _, line := range conflictReport(gi) {
 				fmt.Println(line)
 			}

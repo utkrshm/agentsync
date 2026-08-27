@@ -193,6 +193,11 @@ func TestCmdReceiveConflictGroupArchivesOnlyRepeatably(t *testing.T) {
 			t.Errorf("run 1 output missing %q:\n%s", want, out1)
 		}
 	}
+	// Parity with `conflicts` paragraphing: the report sits in its own
+	// blank-line-delimited block regardless of preceding neighbor lines.
+	if !strings.HasPrefix(out1, "\nCONFLICT: ses_conf has 2 preserved revisions") {
+		t.Errorf("conflict report must start on its own separated block:\n%q", out1[:80])
+	}
 	if strings.Contains(out1, "Writing back") || strings.Contains(out1, "would write back") {
 		t.Errorf("conflicted session must never be written back:\n%s", out1)
 	}
