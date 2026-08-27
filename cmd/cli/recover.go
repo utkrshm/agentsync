@@ -304,7 +304,6 @@ func cmdRecover(args []string) error {
 	if ref.Meta != nil {
 		title = ref.Meta.Title
 	}
-	siblings := archiveSiblings(chosen, gi.Group.Revisions)
 
 	idx, err := openRepoIndex()
 	if err != nil {
@@ -331,17 +330,14 @@ func cmdRecover(args []string) error {
 	}
 
 	ad := buildWriteBackAdapter(cfg)
-	s := &session.Session{ID: sessionID, Tool: session.ToolOpenCode, CanonicalKey: session.CanonicalKey(key), PayloadPath: ref.PayloadPath}
-	if verr := ad.ValidateArtifact(s); verr != nil {
-		return fmt.Errorf("artifact check failed before write-back: %w (nothing was changed)", verr)
-	}
 	if dryRun {
 		fmt.Printf("DRY RUN: would recover %s of %s (%s) into %d validated clone(s):\n", digest12(chosen), sessionID, title, len(paths))
 		for _, p := range paths {
 			fmt.Printf("  %s\n", p)
 		}
+		siblingHeads := archiveSiblings(chosen, gi.Group.Heads)
 		fmt.Printf("DRY RUN: would mark %d sibling revision(s) archive-only per clone%s\n",
-			len(siblings), siblingListSuffix(siblings))
+			len(siblingHeads), siblingListSuffix(siblingHeads))
 		return nil
 	}
 
@@ -355,23 +351,37 @@ func cmdRecover(args []string) error {
 	}
 
 	fmt.Printf("Recovering %s of %s (%s) into %d clone(s)...\n", digest12(chosen), sessionID, title, len(paths))
-	res := ad.BroadcastWriteBack(s, paths)
-	recordBroadcast(local, chosen, sessionID, res)
-	reportBroadcast(res, sessionID, key)
-
-	for _, sibDigest := range siblings {
-		recordArchiveOnlyForPaths(local, sibDigest, sessionID, paths)
+	// Shared guarded pipeline with `sync` (docs/sync-rekey-collapse-plan.md
+	// Step 4): candidate re-validation, artifact/version pinning, UID-scoped
+	// per-clone process guard, verified/degraded bookkeeping, sibling-heads
+	// archive-only marking — all in one place.
+	if _, rerr := restoreRevision(repo, idx, local, ad, gi, chosen, paths); rerr != nil {
+		return rerr
 	}
+	reportRecovered(local, chosen, sessionID, key, gi.Group.Heads)
 
-	fmt.Printf("Recovered %s of %s.\n", digest12(chosen), sessionID)
-	if len(res.Imported) > 1 {
-		fmt.Printf("WARNING: recovered into %d clones — OpenCode's session↔project model is one-to-one, so the association moved to the LAST-imported clone.\n", len(res.Imported))
+	return nil
+}
+
+// reportRecovered prints recover's post-run summary on top of the shared
+// restoreRevision pipeline: the one-to-one degradation warning, what remains
+// preserved, and how to switch revisions later.
+func reportRecovered(local *receivestate.Store, chosenDigest, sessionID, key string, heads []conflict.Revision) {
+	imported := importedTargetCounts(local, chosenDigest)
+	switch imported {
+	case 0:
+		fmt.Println("No clone accepted the write-back; nothing was changed in OpenCode storage.")
+	default:
+		fmt.Printf("Recovered %s of %s.\n", digest12(chosenDigest), sessionID)
 	}
+	if imported > 1 {
+		fmt.Printf("WARNING: recovered into %d clones — OpenCode's session↔project model is one-to-one, so the association moved to the LAST-imported clone.\n", imported)
+	}
+	siblings := archiveSiblings(chosenDigest, heads)
 	if len(siblings) > 0 {
 		fmt.Printf("Sibling revision(s) remain preserved/archive-only:%s — nothing was deleted.\n", siblingListSuffix(siblings))
 	}
 	fmt.Printf("Re-run `agent-sync recover %s` any time to switch revisions: the active association moves to the newly imported one; earlier copies stay in OpenCode storage.\n", sessionID)
-	return nil
 }
 
 // siblingListSuffix renders sibling digests for summary/dry-run lines:
