@@ -12,20 +12,28 @@ import (
 
 // conflictGroup pairs a detected conflict.Detect group with every walker ref
 // that belongs to it, so reporting and payload selection can use full
-// sidecar/path knowledge while grouping stays digest-based.
+// sidecar/path knowledge while grouping stays digest-and-device based.
 type conflictGroup struct {
 	Group conflict.Group
 	Refs  []revisionRef // all refs of this (Key, SessionID), walker order
 }
 
 // buildConflictGroups converts walker refs into deterministic conflict groups
-// (docs/session-conflict-handling-plan.md §3): grouped by canonical key +
-// original session id, identical digests deduped, ≥2 distinct digests flagged
-// conflicted. Groups are ordered by Key then SessionID; refs keep walker order.
+// (docs/session-conflict-handling-plan.md §3, DetectV2 collapse per
+// docs/sync-rekey-collapse-plan.md Step 2): grouped by canonical key +
+// original session id, bucketed by producing device (sidecar SourceDeviceID;
+// missing sidecar or blank id shares the single unknown bucket), each device
+// chain collapsed to its newest capture, ≥2 heads flagged conflicted.
+// Groups are ordered by Key then SessionID; refs keep walker order.
 func buildConflictGroups(refs []revisionRef) []conflictGroup {
 	crevs := make([]conflict.Revision, 0, len(refs))
 	for _, r := range refs {
-		crevs = append(crevs, conflict.Revision{Key: r.Key, SessionID: r.SessionID, Digest: r.Digest})
+		crev := conflict.Revision{Key: r.Key, SessionID: r.SessionID, Digest: r.Digest}
+		if r.Meta != nil {
+			crev.Device = r.Meta.SourceDeviceID
+			crev.CapturedAt = r.Meta.CapturedAt
+		}
+		crevs = append(crevs, crev)
 	}
 	groups := conflict.Detect(crevs)
 
@@ -201,15 +209,19 @@ func metaRepairHint(refs []revisionRef) string {
 }
 
 // conflictReport builds the explicit multi-line report printed for a
-// conflicted session: header, one line per preserved revision (digest-sorted,
-// matching group.Revisions order), and the actionable recovery hint.
-// Detection is passive — nothing is restored here — so the report is stable
-// across runs.
+// conflicted session: header, one line per surviving DEVICE head (superseded
+// mid-chain revisions stay out of the way but are counted in the header's
+// superseded suffix), and the actionable recovery hint. Detection is passive
+// — nothing is restored here — so the report is stable across runs.
 func conflictReport(gi conflictGroup) []string {
-	lines := []string{fmt.Sprintf(
-		"CONFLICT: %s has %d preserved revisions — nothing restored",
-		gi.Group.SessionID, len(gi.Group.Revisions))}
-	for _, rev := range gi.Group.Revisions {
+	header := fmt.Sprintf(
+		"CONFLICT: %s has %d preserved revisions", gi.Group.SessionID, len(gi.Group.Revisions))
+	if gi.Group.Superseded > 0 {
+		header += fmt.Sprintf(" (%d older superseded)", gi.Group.Superseded)
+	}
+	header += " — nothing restored"
+	lines := []string{header}
+	for _, rev := range gi.Group.Heads {
 		ref, ok := primaryRef(gi.Refs, rev.Digest)
 		if !ok {
 			continue // unreachable: group members come from these refs

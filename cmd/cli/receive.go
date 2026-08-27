@@ -126,15 +126,16 @@ func cmdReceive(args []string) error {
 			}
 			if dryRun {
 				fmt.Printf("DRY RUN: would mark %d revision(s) of %s archive-only; nothing restored.\n",
-					len(gi.Group.Revisions), sessionID)
+					len(gi.Group.Heads), sessionID)
 				continue
 			}
 			recordConflictArchiveOnly(local, idx, gi)
 			continue
 		}
 
-		// Single-revision group: normal guarded write-back flow.
-		ref, ok := primaryRef(gi.Refs, gi.Group.Revisions[0].Digest)
+		// Single-head group: normal guarded write-back flow, restoring the
+		// surviving head (not merely the digest-sorted first audit entry).
+		ref, ok := primaryRef(gi.Refs, gi.Group.Heads[0].Digest)
 		if !ok {
 			continue // unreachable: group members derive from these refs
 		}
@@ -213,10 +214,10 @@ func cmdReceive(args []string) error {
 	return nil
 }
 
-// recordConflictArchiveOnly marks every revision of a conflicted group
-// archive-only, keyed per digest×candidate-path. It resolves candidates via
-// the repo-index cache like any other session, but NEVER imports anything and
-// NEVER writes busy/failed retry state — a conflict supersedes stale retry
+// recordConflictArchiveOnly marks every surviving device HEAD of a conflicted
+// group archive-only, keyed per digest×candidate-path. It resolves candidates
+// via the repo-index cache like any other session, but NEVER imports anything
+// and NEVER writes busy/failed retry state — a conflict supersedes stale retry
 // outcomes instead of feeding them.
 //
 // Detection must be repeatable without state churn: outcomes that already say
@@ -233,13 +234,13 @@ func recordConflictArchiveOnly(local *receivestate.Store, idx *repoindex.DB, gi 
 	}
 	if len(candidates) == 0 {
 		title := ""
-		if ref, ok := primaryRef(gi.Refs, gi.Group.Revisions[0].Digest); ok && ref.Meta != nil {
+		if ref, ok := primaryRef(gi.Refs, gi.Group.Heads[0].Digest); ok && ref.Meta != nil {
 			title = ref.Meta.Title
 		}
 		fmt.Printf("Archived only: %s (%s) has no local clone for %s. Run agent-sync index after cloning.\n", sessionID, title, gi.Group.Key)
 		return
 	}
-	for _, rev := range gi.Group.Revisions {
+	for _, rev := range gi.Group.Heads {
 		for _, candidate := range candidates {
 			if err := repoindex.ValidateCandidate(key, candidate.LocalPath); err != nil {
 				fmt.Fprintf(os.Stderr, "receive: action=revalidate session=%s path=%q status=skip error=%q\n", sessionID, candidate.LocalPath, err)

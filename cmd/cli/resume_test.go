@@ -9,9 +9,10 @@ import (
 
 // resumeEntries must collapse multi-revision sessions into ONE entry labeled
 // "(N revisions — conflicted)" and keep clean sessions as plain entries,
-// sorted by session id.
+// sorted by session id. The two ses_a revisions come from DIFFERENT devices
+// (a named one plus the unknown bucket), so DetectV2 keeps both heads.
 func TestResumeEntriesGrouping(t *testing.T) {
-	newest := &revision.Meta{Title: "Shared conversation", CapturedAt: ts(t, "2026-08-21T09:31:45Z")}
+	newest := &revision.Meta{Title: "Shared conversation", SourceDeviceID: "dev-new", CapturedAt: ts(t, "2026-08-21T09:31:45Z")}
 	older := &revision.Meta{Title: "Shared conversation", CapturedAt: ts(t, "2026-08-20T14:02:11Z")}
 	titled := &revision.Meta{Title: "Solo work"}
 	refs := []revisionRef{
@@ -29,11 +30,31 @@ func TestResumeEntriesGrouping(t *testing.T) {
 	}
 }
 
+// A linear single-device history is progress, not divergence: the entry stays
+// clean at ONE head and its title carries an honest "(N older superseded)"
+// suffix instead of inflating the count.
+func TestResumeEntriesSameDeviceChainShowsSupersededSuffix(t *testing.T) {
+	refs := []revisionRef{
+		metaRef("k", "ses_chain", "aa01", "/r/c/aa.json",
+			&revision.Meta{SourceDeviceID: "dev-a", CapturedAt: ts(t, "2026-08-20T10:00:00Z")}),
+		metaRef("k", "ses_chain", "bb02", "/r/c/bb.json",
+			&revision.Meta{SourceDeviceID: "dev-a", CapturedAt: ts(t, "2026-08-20T10:05:00Z")}),
+	}
+	got := resumeEntries(refs)
+	want := []sessionEntry{
+		{ID: "ses_chain", Key: "k", Title: "(untitled) (1 older superseded)", Conflicted: false, RevCount: 1},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("entries = %+v\nwant %+v", got, want)
+	}
+}
+
 // Untitled sidecars fall back to "(untitled)"; the conflicted suffix still
-// applies.
+// applies. One ref carries a named device while the sidecar-less one shares
+// the unknown bucket, so the two remain distinct heads (DetectV2).
 func TestResumeEntriesUntitledFallback(t *testing.T) {
 	refs := []revisionRef{
-		metaRef("k", "ses_u", "aa", "/r/aa.json", &revision.Meta{}),
+		metaRef("k", "ses_u", "aa", "/r/aa.json", &revision.Meta{SourceDeviceID: "dev-u"}),
 		metaRef("k", "ses_u", "bb", "/r/bb.json", nil),
 	}
 	got := resumeEntries(refs)

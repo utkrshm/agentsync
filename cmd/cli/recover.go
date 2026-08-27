@@ -120,11 +120,18 @@ var buildWriteBackAdapter = func(cfg config.Config) *opencode.Adapter {
 }
 
 // pickRevisionInteractive presents the numbered picker over a conflicted
-// group's revisions (same bufio pattern as resume's session picker) and
-// returns the chosen digest. Blank input aborts cleanly with ok=false.
+// group's surviving DEVICE HEADS (superseded mid-chain revisions stay hidden;
+// they remain reachable via --revision <digest-prefix>), using the same bufio
+// pattern as resume's session picker, and returns the chosen digest. Blank
+// input aborts cleanly with ok=false.
 func pickRevisionInteractive(gi conflictGroup) (digest string, ok bool, err error) {
-	fmt.Printf("\n%s has %d preserved revisions:\n", gi.Group.SessionID, len(gi.Group.Revisions))
-	for i, rev := range gi.Group.Revisions {
+	header := fmt.Sprintf("\n%s has %d preserved revision heads:",
+		gi.Group.SessionID, len(gi.Group.Heads))
+	if gi.Group.Superseded > 0 {
+		header += fmt.Sprintf(" (+%d older superseded — pickable via --revision)", gi.Group.Superseded)
+	}
+	fmt.Println(header)
+	for i, rev := range gi.Group.Heads {
 		ref, found := primaryRef(gi.Refs, rev.Digest)
 		if !found {
 			continue // unreachable: group members come from these refs
@@ -142,10 +149,10 @@ func pickRevisionInteractive(gi conflictGroup) (digest string, ok bool, err erro
 		return "", false, nil
 	}
 	var n int
-	if _, perr := fmt.Sscanf(sel, "%d", &n); perr != nil || n < 1 || n > len(gi.Group.Revisions) {
+	if _, perr := fmt.Sscanf(sel, "%d", &n); perr != nil || n < 1 || n > len(gi.Group.Heads) {
 		return "", false, fmt.Errorf("invalid selection %q", sel)
 	}
-	return gi.Group.Revisions[n-1].Digest, true, nil
+	return gi.Group.Heads[n-1].Digest, true, nil
 }
 
 // recordArchiveOnlyForPaths explicitly marks every digest×path outcome

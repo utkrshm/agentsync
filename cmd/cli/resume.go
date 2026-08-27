@@ -107,11 +107,16 @@ type sessionEntry struct {
 	RevCount   int // distinct revisions behind this entry (1 when clean)
 }
 
-// resumeEntries builds picker entries from conflict groups over walker refs:
-// a single-revision session becomes one plain entry titled from its sidecar
-// ("(untitled)" without one); a multi-revision session collapses into ONE
-// entry titled "<title> (N revisions — conflicted)". Entries are sorted by
-// session id for stable presentation.
+// resumeEntries builds picker entries from conflict groups over walker refs
+// (DetectV2: per-device chains collapse to heads):
+//   - a session whose device chains agree becomes one plain entry titled from
+//     its sidecar ("(untitled)" without one), counted by surviving HEADS;
+//   - a conflicted session collapses into ONE entry titled
+//     "<title> (N revisions — conflicted)";
+//   - superseded mid-chain revisions are shown as an "(N older superseded)"
+//     suffix rather than inflating the head count.
+//
+// Entries are sorted by session id for stable presentation.
 func resumeEntries(refs []revisionRef) []sessionEntry {
 	groups := buildConflictGroups(refs)
 	out := make([]sessionEntry, 0, len(groups))
@@ -129,10 +134,13 @@ func resumeEntries(refs []revisionRef) []sessionEntry {
 			Key:        gi.Group.Key,
 			Title:      title,
 			Conflicted: gi.Group.Conflicted,
-			RevCount:   len(gi.Group.Revisions),
+			RevCount:   len(gi.Group.Heads),
 		}
 		if e.Conflicted {
 			e.Title = fmt.Sprintf("%s (%d revisions — conflicted)", title, e.RevCount)
+		}
+		if gi.Group.Superseded > 0 {
+			e.Title += fmt.Sprintf(" (%d older superseded)", gi.Group.Superseded)
 		}
 		out = append(out, e)
 	}

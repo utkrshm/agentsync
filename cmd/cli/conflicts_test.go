@@ -92,10 +92,11 @@ func TestShortDigest(t *testing.T) {
 }
 
 // Grouping over walker refs: same digest via legacy + revisions layout
-// collapses to one clean group; two distinct digests flag a conflict; groups
-// order by key then session id.
+// collapses to one clean group; two distinct DIGESTS from different device
+// buckets flag a conflict (DetectV2), while sidecar knowledge and legacy
+// layouts coexist; groups order by key then session id.
 func TestBuildConflictGroupsOverRefs(t *testing.T) {
-	m1 := &revision.Meta{Title: "one"}
+	m1 := &revision.Meta{Title: "one", SourceDeviceID: "dev-a"}
 	m2 := &revision.Meta{Title: "two"}
 	refs := []revisionRef{
 		metaRef("kb", "ses_b", "dd", "/r/kb/b/dd.json", m2),
@@ -111,6 +112,7 @@ func TestBuildConflictGroupsOverRefs(t *testing.T) {
 		key       string
 		sid       string
 		digests   []string
+		heads     []string // digest@device, DetectV2 per-device collapse
 		conflict  bool
 		refCounts int
 	}
@@ -120,13 +122,16 @@ func TestBuildConflictGroupsOverRefs(t *testing.T) {
 		for _, r := range g.Group.Revisions {
 			s.digests = append(s.digests, r.Digest)
 		}
+		for _, h := range g.Group.Heads {
+			s.heads = append(s.heads, h.Digest+"@"+h.Device)
+		}
 		gotSigs = append(gotSigs, s)
 	}
 	want := []sig{
-		{key: "ka", sid: "ses_a", digests: []string{"aa", "bb"}, conflict: true, refCounts: 2},
-		{key: "ka", sid: "ses_z", digests: []string{"ee"}, conflict: false, refCounts: 1},
-		{key: "kb", sid: "ses_b", digests: []string{"dd"}, conflict: false, refCounts: 1},
-		{key: "kc", sid: "ses_c", digests: []string{"cc"}, conflict: false, refCounts: 2},
+		{key: "ka", sid: "ses_a", digests: []string{"aa", "bb"}, heads: []string{"aa@dev-a", "bb@"}, conflict: true, refCounts: 2},
+		{key: "ka", sid: "ses_z", digests: []string{"ee"}, heads: []string{"ee@"}, conflict: false, refCounts: 1},
+		{key: "kb", sid: "ses_b", digests: []string{"dd"}, heads: []string{"dd@"}, conflict: false, refCounts: 1},
+		{key: "kc", sid: "ses_c", digests: []string{"cc"}, heads: []string{"cc@dev-a"}, conflict: false, refCounts: 2},
 	}
 	if !reflect.DeepEqual(gotSigs, want) {
 		t.Fatalf("groups = %+v\nwant %+v", gotSigs, want)
@@ -251,6 +256,36 @@ func TestConflictsReportBlockSeparation(t *testing.T) {
 	}
 	if strings.Contains(out, "\n\n\n") {
 		t.Errorf("separator doubling must never appear:\n%s", out)
+	}
+}
+
+// DetectV2 report composition: one device's mid-chain capture is superseded,
+// so the header grows an honest "(1 older superseded)" suffix and lists only
+// the surviving heads as rows.
+func TestConflictReportShapeWithSupersededChain(t *testing.T) {
+	t0 := ts(t, "2026-08-20T14:02:11Z")
+	t1 := ts(t, "2026-08-21T09:31:45Z")
+	refs := []revisionRef{
+		metaRef("k", "ses_x", "77b2e0fff", "/r/77b2e0.json",
+			&revision.Meta{DeviceAlias: "laptop", CapturedAt: t0}),
+		metaRef("k", "ses_x", "a3f9c1aaa", "/r/a3f9c1.json",
+			&revision.Meta{DeviceAlias: "laptop", CapturedAt: t1}), // same device, newer
+		metaRef("k", "ses_x", "b5e6d7c8", "/r/b5e6d7.json",
+			&revision.Meta{SourceDeviceID: "dev-desktop", CapturedAt: ts(t, "2026-08-21T10:00:00Z")}),
+	}
+	gi := buildConflictGroups(refs)[0]
+	lines := conflictReport(gi)
+	want := []string{
+		"CONFLICT: ses_x has 3 preserved revisions (1 older superseded) — nothing restored",
+		// Heads digest-sorted across buckets; the superseded laptop capture
+		// is absent from the rows — its bucket's NEWEST survives.
+		"  a3f9c1… laptop 2026-08-21 09:31 UTC",
+		"  b5e6d7… dev-desktop 2026-08-21 10:00 UTC",
+		"  last modified by dev-desktop at 2026-08-21 10:00 UTC",
+		"Run `agent-sync recover ses_x` to restore a chosen revision.",
+	}
+	if !reflect.DeepEqual(lines, want) {
+		t.Fatalf("report:\n%s\nwant:\n%s", stringsJoin(lines), stringsJoin(want))
 	}
 }
 
